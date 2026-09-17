@@ -27,8 +27,13 @@ The data pipeline: how telemetry flows from OLS components through the collector
 10. Pipelines (receiver → processor → exporter chains) MUST be defined per signal type (metrics, traces, logs).
 11. A misconfigured pipeline MUST fail at startup with a clear error, not at runtime.
 
+### Agentic Product-Data Branch
+
+12. The planned trace-to-file branch is specified in `what/agentic-data-collection.md`; the parent [`Agentic Data Collection`](../../../../.ai/spec/what/agentic-data-collection.md) specification owns its accepted cross-repository interface and product semantics. `[PLANNED: OLS-3569]`
+
 ## Planned Changes
 
 | Ticket | Summary |
 |---|---|
 | — | All rules are planned — initial design |
+| OLS-3569 | Trace-only Agentic candidate classification and JSONL spool branch |

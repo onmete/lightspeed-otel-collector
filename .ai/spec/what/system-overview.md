@@ -22,20 +22,25 @@ The Lightspeed OTel Collector is a custom OpenTelemetry Collector distribution t
 8. The collector MUST support traces (OTLP ingestion).
 9. The collector SHOULD support logs (OTLP ingestion) — initially optional, required when structured logging is adopted across OLS components.
 
+### Agentic Data Collection
+
+10. Collector-local trace filtering, atom projection, and atomic file publication are specified in `what/agentic-data-collection.md`; the parent [`Agentic Data Collection`](../../../../.ai/spec/what/agentic-data-collection.md) specification owns the end-to-end contract. `[PLANNED: OLS-3569]`
+
 ### Resilience
 
-10. The collector MUST buffer data during transient export failures using a bounded in-memory or persistent queue.
-11. Queue overflow MUST result in back-pressure or oldest-first eviction, never silent data loss.
-12. The collector MUST expose its own health and performance metrics (queue depth, export success/failure rates, dropped spans/metrics).
+11. The collector MUST buffer data during transient export failures using a bounded in-memory or persistent queue.
+12. Queue overflow MUST result in back-pressure or oldest-first eviction, never silent data loss.
+13. The collector MUST expose its own health and performance metrics (queue depth, export success/failure rates, dropped spans/metrics).
 
 ## Configuration Surface
 
 | Field/Flag | Type | Default | Description |
 |---|---|---|---|
-| Configuration follows standard OTel Collector YAML config — receivers, processors, exporters, pipelines. Configuration is documented per-component: see `what/collector.md` for collector configuration and `what/postgres-exporter.md` for the postgres exporter configuration. ||||
+| Configuration follows standard OTel Collector YAML config — receivers, processors, exporters, pipelines. Configuration is documented per-component: see `what/collector.md` for Collector configuration, `what/postgres-exporter.md` for the PostgreSQL exporter, and `what/agentic-data-collection.md` for planned Agentic Collector mechanics. ||||
 
 ## Planned Changes
 
 | Ticket | Summary |
 |---|---|
 | — | Initial implementation — all rules above are planned |
+| OLS-3569 | Collector-local Agentic trace filtering and atomic JSONL publication |

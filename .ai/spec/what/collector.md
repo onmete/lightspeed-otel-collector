@@ -15,6 +15,7 @@ Custom OpenTelemetry Collector for OpenShift Lightspeed. Built with the OpenTele
      - `otlphttpexporter` (standard) — forwards telemetry via HTTP
      - `debugexporter` (standard) — logs to stdout for development
      - `nopexporter` (standard) — silently drops data (used for pipelines that must exist but have no backend)
+     - Agentic trace-to-file export capability (custom, this repo) — filters, mechanically classifies and projects eligible trace atoms, then publishes atomic JSONL files as specified in `what/agentic-data-collection.md`. `[PLANNED: OLS-3569]`
    - **Processors:** `batchprocessor` — accumulates records before export
    - **Connectors:** `routingconnector` — routes telemetry to different pipelines based on OTTL conditions
    - **Extensions:**
@@ -37,6 +38,8 @@ Custom OpenTelemetry Collector for OpenShift Lightspeed. Built with the OpenTele
    - **Metrics:** no pipeline defined in routing mode.
      - _Current behavior_ `[KNOWN VIOLATION of Constraint 2]`: metrics are silently dropped with no log or observable signal.
      - _Required behavior_: when no pipeline matches, the collector MUST log a warning and expose a metric counter for dropped spans/metrics — silent drops are prohibited (Constraint 2). `[PLANNED]` Add a metrics pipeline or explicit no-op exporter with observable error metrics.
+
+7a. The Agentic component's local settings, static validation, queue isolation, and filesystem failure behavior are specified once in `what/agentic-data-collection.md`. Cross-repository collection policy and deployment are defined by the parent [`Agentic Data Collection`](../../../../.ai/spec/what/agentic-data-collection.md) contract. `[PLANNED: OLS-3569]`
 
 ### Deployment
 
@@ -214,3 +217,4 @@ service:
 
 - `what/postgres-exporter.md` — Custom `postgresexporter` implementation details
 - `what/pipeline.md` — Pipeline architecture. `[PLANNED]` Hub/spoke for fleet observability is not yet implemented — see PLANNED sections in `pipeline.md`.
+- `what/agentic-data-collection.md` — Collector-local Agentic trace filtering, projection, and atomic JSONL publication; the parent [`Agentic Data Collection`](../../../../.ai/spec/what/agentic-data-collection.md) specification owns the cross-repository contract. `[PLANNED: OLS-3569]`
