@@ -15,6 +15,7 @@ Custom OpenTelemetry Collector for OpenShift Lightspeed. Built with the OpenTele
      - `otlphttpexporter` (standard) — forwards telemetry via HTTP
      - `debugexporter` (standard) — logs to stdout for development
      - `nopexporter` (standard) — silently drops data (used for pipelines that must exist but have no backend)
+     - Agentic trace-to-file export capability (custom, this repo) — filters, mechanically classifies and projects eligible trace atoms, then publishes atomic JSONL files as specified in `what/agentic-data-collection.md`. `[PLANNED: OLS-3569]`
    - **Processors:** `batchprocessor` — accumulates records before export
    - **Connectors:** `routingconnector` — routes telemetry to different pipelines based on OTTL conditions
    - **Extensions:**
@@ -38,14 +39,16 @@ Custom OpenTelemetry Collector for OpenShift Lightspeed. Built with the OpenTele
      - _Current behavior_ `[KNOWN VIOLATION of Constraint 2]`: metrics are silently dropped with no log or observable signal.
      - _Required behavior_: when no pipeline matches, the collector MUST log a warning and expose a metric counter for dropped spans/metrics — silent drops are prohibited (Constraint 2). `[PLANNED]` Add a metrics pipeline or explicit no-op exporter with observable error metrics.
 
+8. The Agentic component's local settings, static validation, queue isolation, and filesystem failure behavior are specified once in `what/agentic-data-collection.md`. Cross-repository collection policy and deployment are defined by the parent [`Agentic Data Collection`](../../../../.ai/spec/what/agentic-data-collection.md) contract. `[PLANNED: OLS-3569]`
+
 ### Deployment
 
-8. The Collector runs as a single-replica Deployment managed by the lightspeed-operator.
-9. The Collector listens on port 4317 (gRPC/TLS) and 4318 (HTTPS) for OTLP connections.
-10. The Collector connects to PostgreSQL using credentials injected via environment variable (`POSTGRES_CONNECTION_STRING`). The connection uses TLS (`sslmode=require`).
-11. A health check endpoint runs on port 13133.
-12. The admin API runs on port 8080 over HTTPS (GET/DELETE log records by agentic run ID). GET supports `format=text` query parameter for plain-text output (`text/plain`): a metadata header (`agentic_run_id`, `records`, `has_more`), blank line, then one `timestamp: body` per line. Default is JSON with full record fields.
-13. Cluster-facing Prometheus metrics are served on port 8888 over HTTPS via the `https_metrics` extension (reverse-proxies localhost-only stock telemetry pull).
+9. The Collector runs as a single-replica Deployment managed by the lightspeed-operator.
+10. The Collector listens on port 4317 (gRPC/TLS) and 4318 (HTTPS) for OTLP connections.
+11. The Collector connects to PostgreSQL using credentials injected via environment variable (`POSTGRES_CONNECTION_STRING`). The connection uses TLS (`sslmode=require`).
+12. A health check endpoint runs on port 13133.
+13. The admin API runs on port 8080 over HTTPS (GET/DELETE log records by agentic run ID). GET supports `format=text` query parameter for plain-text output (`text/plain`): a metadata header (`agentic_run_id`, `records`, `has_more`), blank line, then one `timestamp: body` per line. Default is JSON with full record fields.
+14. Cluster-facing Prometheus metrics are served on port 8888 over HTTPS via the `https_metrics` extension (reverse-proxies localhost-only stock telemetry pull).
 
 ### TLS
 
@@ -70,21 +73,21 @@ The OTel Collector starts extensions before pipelines. The `postgres_admin` exte
 - `IF NOT EXISTS` is idempotent — restarts are safe, but the DDL does not validate or migrate an existing table's column definitions. If the schema was previously created with different columns, the exporter's INSERT will fail at runtime.
 ### Health
 
-14. The Collector exposes the standard OTel Collector health check extension on port 13133 (`/`). The lightspeed-operator uses this for liveness and readiness probes.
+15. The Collector exposes the standard OTel Collector health check extension on port 13133 (`/`). The lightspeed-operator uses this for liveness and readiness probes.
 
 ### Data Durability
 
-15. The exporter uses retry with exponential backoff and a file-backed sending queue (via `file_storage` extension).
-16. The queue survives pod restarts (backed by persistent volume or emptyDir).
-17. Node failures may lose in-flight queue data.
+16. The exporter uses retry with exponential backoff and a file-backed sending queue (via `file_storage` extension).
+17. The queue survives pod restarts (backed by persistent volume or emptyDir).
+18. Node failures may lose in-flight queue data.
 
 ## Container Image
 
-18. The Dockerfile builds the Collector in a multi-stage build:
+19. The Dockerfile builds the Collector in a multi-stage build:
     - **Stage 1:** `ubi9/go-toolset` — installs OCB, runs `ocb --config=builder-config.yaml` to produce the binary.
     - **Stage 2:** `ubi9/ubi-minimal` — minimal runtime with the Collector binary only.
-19. The image runs as non-root (UID 65532).
-20. The image is built and shipped via Konflux (pipeline definition is a separate ticket).
+20. The image runs as non-root (UID 65532).
+21. The image is built and shipped via Konflux (pipeline definition is a separate ticket).
 
 ## Repository Contents
 
@@ -214,3 +217,4 @@ service:
 
 - `what/postgres-exporter.md` — Custom `postgresexporter` implementation details
 - `what/pipeline.md` — Pipeline architecture. `[PLANNED]` Hub/spoke for fleet observability is not yet implemented — see PLANNED sections in `pipeline.md`.
+- `what/agentic-data-collection.md` — Collector-local Agentic trace filtering, projection, and atomic JSONL publication; the parent [`Agentic Data Collection`](../../../../.ai/spec/what/agentic-data-collection.md) specification owns the cross-repository contract. `[PLANNED: OLS-3569]`

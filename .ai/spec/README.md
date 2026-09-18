@@ -23,6 +23,7 @@ AI agents. Content is optimized for precision and machine consumption.
 | Understand the system | `what/system-overview.md` |
 | Understand the data pipeline | `what/pipeline.md` |
 | HTTPS Prometheus metrics (OLS-3656) | `what/https-metrics.md` |
+| Implement Agentic trace-to-file collection (OLS-3569) | `what/agentic-data-collection.md` |
 
 ## Conventions
 
