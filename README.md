@@ -1,12 +1,13 @@
 # OpenTelemetry Collector — OpenShift Lightspeed
 
 Custom OpenTelemetry Collector distribution for OpenShift Lightspeed.
-Receives OTLP logs over TLS and writes them to PostgreSQL.
+Receives OTLP telemetry over TLS and routes logs to PostgreSQL or eligible Agentic traces to local JSONL streams.
 
 ```
 App --OTLP/TLS--> receiver --> batch processor --> postgresexporter --> PostgreSQL (TLS)
 
 App ---------- GET/DELETE /api/v1/logs (HTTPS) --> postgres_admin --> PostgreSQL (TLS)
+Agentic app --OTLP/TLS--> receiver --> agenticdataexporter --> Actions/Transcripts JSONL
 ```
 
 ## Project Structure
@@ -19,6 +20,13 @@ App ---------- GET/DELETE /api/v1/logs (HTTPS) --> postgres_admin --> PostgreSQL
 │   └── go.mod / go.sum              # Full dependency graph (used by cachi2)
 ├── Dockerfile                       # Multi-stage UBI9 container build
 ├── Makefile                         # Build, test, container targets
+├── agenticdataexporter/
+│   ├── go.mod / go.sum              # Go module for Agentic trace collection
+│   ├── config.go                    # Separate Actions/Transcripts directories
+│   ├── factory.go                   # Trace exporter registration and queue isolation
+│   ├── exporter.go                  # Mechanical classification, projection, and JSONL publication
+│   ├── telemetry.go                 # Bounded classification and rejection counters
+│   └── exporter_test.go             # Classification, projection, and publication tests
 ├── postgresexporter/
 │   ├── go.mod                       # Go module (pgx/v5)
 │   ├── doc.go                       # Package documentation
@@ -70,9 +78,9 @@ make generate
 
 ## Log Record Schema
 
-The exporter writes a 5-column schema optimised for agentic run audit log
-storage. The `postgres_admin` extension creates the table automatically on
-startup (idempotent `CREATE TABLE IF NOT EXISTS`).
+The PostgreSQL exporter writes a 5-column schema optimised for agentic run
+audit log storage. The `postgres_admin` extension creates the table
+automatically on startup (idempotent `CREATE TABLE IF NOT EXISTS`).
 
 ```sql
 CREATE TABLE templogs.logs (
@@ -187,8 +195,8 @@ make docker-build VERSION=0.1.0
 
 ## Data Durability
 
-The exporter uses **retry with exponential backoff** and a **file-backed
-sending queue** (via the `file_storage` extension):
+The PostgreSQL exporter uses **retry with exponential backoff** and a
+**file-backed sending queue** (via the `file_storage` extension):
 
 | Failure scenario | What happens |
 |---|---|

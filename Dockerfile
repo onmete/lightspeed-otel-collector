@@ -10,6 +10,7 @@ WORKDIR /workspace
 # Cache module downloads — copy go.mod/go.sum first so source changes
 # don't invalidate the download layer.
 COPY cmd/otelcol-lightspeed/go.mod cmd/otelcol-lightspeed/go.sum cmd/otelcol-lightspeed/
+COPY agenticdataexporter/go.mod agenticdataexporter/go.sum agenticdataexporter/
 COPY postgresexporter/go.mod postgresexporter/go.sum postgresexporter/
 COPY extension/postgresadmin/go.mod extension/postgresadmin/go.sum extension/postgresadmin/
 COPY extension/httpsmetrics/go.mod extension/httpsmetrics/go.sum extension/httpsmetrics/
@@ -17,6 +18,7 @@ RUN cd cmd/otelcol-lightspeed && go mod download
 
 # Copy source.
 COPY cmd/otelcol-lightspeed/ cmd/otelcol-lightspeed/
+COPY agenticdataexporter/ agenticdataexporter/
 COPY postgresexporter/ postgresexporter/
 COPY extension/ extension/
 
