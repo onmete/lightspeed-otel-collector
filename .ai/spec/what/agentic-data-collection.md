@@ -85,7 +85,7 @@ Collector-local implementation contract for OLS-4248 and OLS-4249. The parent [`
 | Measurement | Type | Required bounded labels |
 |---|---|---|
 | Candidates classified | Counter | `candidate_type`, `record_kind`, allowed `service_name` |
-| Atoms ignored or rejected | Counter | fixed `reason`: `unsupported_service`, `missing_uid`, `missing_or_invalid_phase`, `invalid_envelope`, `queue_full` |
+| Atoms ignored or rejected | Counter | fixed `reason`: `unsupported_service`, `missing_uid`, `missing_or_invalid_phase`, `invalid_envelope`, `queue_full`, `shutdown_deadline` |
 | Record size | Histogram | `candidate_type`, `record_kind` |
 | Queue high-water bytes | Gauge | `candidate_type` |
 | Current unpublished records and bytes | Gauges | `candidate_type` |

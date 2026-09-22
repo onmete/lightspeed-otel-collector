@@ -1,14 +1,14 @@
 package agenticexporter
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
-	"math"
-	"strconv"
-
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/ptrace"
+	"math"
+	"strconv"
 )
 
 var errInvalidEnvelope = errors.New(string(rejectInvalidEnvelope))
@@ -24,6 +24,32 @@ type projectionInput struct {
 	span              ptrace.Span
 	event             *ptrace.SpanEvent
 	eventIndex        *int
+}
+type projectionJob struct {
+	traces            ptrace.Traces
+	context           spanContext
+	resourceSchemaURL string
+	scopeSchemaURL    string
+	metricsContext    context.Context
+}
+
+func newProjectionJob(metricsContext context.Context, input projectionInput) projectionJob {
+	traces := ptrace.NewTraces()
+	resourceSpan := traces.ResourceSpans().AppendEmpty()
+	input.resource.CopyTo(resourceSpan.Resource())
+	resourceSpan.SetSchemaUrl(input.resourceSchemaURL)
+	scopeSpan := resourceSpan.ScopeSpans().AppendEmpty()
+	input.scope.CopyTo(scopeSpan.Scope())
+	scopeSpan.SetSchemaUrl(input.scopeSchemaURL)
+	span := scopeSpan.Spans().AppendEmpty()
+	input.span.CopyTo(span)
+	return projectionJob{
+		traces:            traces,
+		context:           input.context,
+		resourceSchemaURL: input.resourceSchemaURL,
+		scopeSchemaURL:    input.scopeSchemaURL,
+		metricsContext:    metricsContext,
+	}
 }
 
 type candidateRecord struct {

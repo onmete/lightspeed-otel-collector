@@ -17,6 +17,7 @@ import (
 const (
 	recoveryInitialBackoff = time.Second
 	recoveryMaxBackoff     = 30 * time.Second
+	maxShutdownFlush       = 30 * time.Second
 )
 
 type streamState int64
@@ -71,9 +72,11 @@ type streamCallbacks struct {
 type fileOps interface {
 	mkdirAll(string, fs.FileMode) error
 	openExclusive(string, fs.FileMode) (batchFile, error)
+	chmod(string, fs.FileMode) error
 	rename(string, string) error
 	remove(string) error
 	readDir(string) ([]fs.DirEntry, error)
+	stat(string) (fs.FileInfo, error)
 }
 
 type batchFile interface {
@@ -83,12 +86,22 @@ type batchFile interface {
 
 type osFileOps struct{}
 
-func (osFileOps) mkdirAll(path string, mode fs.FileMode) error { return os.MkdirAll(path, mode) }
+func (osFileOps) mkdirAll(path string, mode fs.FileMode) error {
+	if info, err := os.Stat(path); err == nil && info.IsDir() {
+		return nil
+	}
+	if err := os.MkdirAll(path, mode); err != nil {
+		return err
+	}
+	return os.Chmod(path, mode)
+}
 func (osFileOps) openExclusive(path string, mode fs.FileMode) (batchFile, error) {
 	return os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, mode)
 }
-func (osFileOps) rename(oldPath, newPath string) error { return os.Rename(oldPath, newPath) }
-func (osFileOps) remove(path string) error             { return os.Remove(path) }
+func (osFileOps) chmod(path string, mode fs.FileMode) error { return os.Chmod(path, mode) }
+func (osFileOps) rename(oldPath, newPath string) error      { return os.Rename(oldPath, newPath) }
+func (osFileOps) remove(path string) error                  { return os.Remove(path) }
+func (osFileOps) stat(path string) (fs.FileInfo, error)     { return os.Lstat(path) }
 func (osFileOps) readDir(path string) ([]fs.DirEntry, error) {
 	return os.ReadDir(path)
 }
@@ -451,9 +464,22 @@ func (w *streamWriter) writePending() bool {
 func (w *streamWriter) openTemp() bool {
 	id := uuid.NewString()
 	tempPath := filepath.Join(w.directory, "."+id+".tmp")
-	file, err := w.ops.openExclusive(tempPath, 0o600)
+	file, err := w.ops.openExclusive(tempPath, 0o660)
 	if err != nil {
 		w.fail(opOpen)
+		return false
+	}
+	if err := w.ops.chmod(tempPath, 0o660); err != nil {
+		closeErr := file.Close()
+		if closeErr != nil {
+			w.recordFailure(opClose)
+		}
+		if removeErr := w.ops.remove(tempPath); removeErr != nil && !errors.Is(removeErr, fs.ErrNotExist) {
+			w.failedPath = tempPath
+			w.fail(opRemoveTmp)
+		} else {
+			w.fail(opOpen)
+		}
 		return false
 	}
 	w.file = file
@@ -529,12 +555,11 @@ func (w *streamWriter) resetTempForRebuild() {
 	w.mu.Lock()
 	w.written = 0
 	w.activeBytes = 0
-	w.activeStarted = time.Time{}
 	w.mu.Unlock()
 }
 
 func (w *streamWriter) preflight() bool {
-	if err := w.ops.mkdirAll(w.directory, 0o750); err != nil {
+	if err := w.ops.mkdirAll(w.directory, 0o770|fs.ModeSetgid); err != nil {
 		w.fail(opMkdir)
 		w.preflightOnRecovery = true
 		return false
@@ -683,8 +708,17 @@ func (w *streamWriter) increaseBackoff() {
 	}
 	w.mu.Unlock()
 }
-
 func (w *streamWriter) flushForShutdown(ctx context.Context) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	flushCtx := ctx
+	cancel := func() {}
+	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
+		flushCtx, cancel = context.WithTimeout(ctx, maxShutdownFlush)
+	}
+	defer cancel()
+
 	for {
 		w.mu.Lock()
 		done := w.unpublishedRecords == 0
@@ -694,7 +728,7 @@ func (w *streamWriter) flushForShutdown(ctx context.Context) {
 			return
 		}
 		select {
-		case <-ctx.Done():
+		case <-flushCtx.Done():
 			w.stopAtShutdownDeadline()
 			return
 		default:
@@ -712,7 +746,7 @@ func (w *streamWriter) flushForShutdown(ctx context.Context) {
 		timer := w.clock.newTimer(delay)
 		select {
 		case <-timer.C():
-		case <-ctx.Done():
+		case <-flushCtx.Done():
 			timer.Stop()
 			w.stopAtShutdownDeadline()
 			return
@@ -745,17 +779,8 @@ func (w *streamWriter) reportShutdownDeadline() {
 }
 
 func (w *streamWriter) readyPathVisible() bool {
-	entries, err := w.ops.readDir(w.directory)
-	if err != nil {
-		return false
-	}
-	name := filepath.Base(w.readyPath)
-	for _, entry := range entries {
-		if entry.Name() == name {
-			return true
-		}
-	}
-	return false
+	_, err := w.ops.stat(w.readyPath)
+	return err == nil
 }
 
 func (w *streamWriter) refreshReadyBacklog() {

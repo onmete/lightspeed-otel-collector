@@ -34,6 +34,7 @@ func TestConsumeTracesRoutesAtomsWithoutMutatingSource(t *testing.T) {
 	if err := exp.consumeTraces(context.Background(), traces); err != nil {
 		t.Fatalf("consumeTraces() error = %v", err)
 	}
+	waitUntil(t, exp.projectionIdle)
 	after, err := marshaler.MarshalTraces(traces)
 	if err != nil {
 		t.Fatalf("MarshalTraces(after) error = %v", err)
@@ -66,6 +67,7 @@ func TestConsumeTracesAcceptsBothServices(t *testing.T) {
 			if err := exp.consumeTraces(context.Background(), traces); err != nil {
 				t.Fatalf("consumeTraces() error = %v", err)
 			}
+			waitUntil(t, exp.projectionIdle)
 			if got := len(queuedRecords(exp.actions)) + len(queuedRecords(exp.transcripts)); got != 3 {
 				t.Fatalf("queued records = %d, want 3", got)
 			}
@@ -93,6 +95,7 @@ func TestConsumeTracesRejectsEachIneligibleSpanReason(t *testing.T) {
 			if err := exp.consumeTraces(context.Background(), traces); err != nil {
 				t.Fatalf("consumeTraces() error = %v", err)
 			}
+			waitUntil(t, exp.projectionIdle)
 			if got := len(queuedRecords(exp.actions)) + len(queuedRecords(exp.transcripts)); got != 0 {
 				t.Fatalf("queued records = %d, want 0", got)
 			}
@@ -112,6 +115,7 @@ func TestConsumeTracesCountsEveryIneligibleAtom(t *testing.T) {
 	if err := exp.consumeTraces(context.Background(), traces); err != nil {
 		t.Fatalf("consumeTraces() error = %v", err)
 	}
+	waitUntil(t, exp.projectionIdle)
 	if got := len(queuedRecords(exp.actions)) + len(queuedRecords(exp.transcripts)); got != 0 {
 		t.Fatalf("queued records = %d, want 0", got)
 	}
@@ -132,6 +136,7 @@ func TestConsumeTracesContainsProjectionAndQueueLoss(t *testing.T) {
 		if err := exp.consumeTraces(context.Background(), traces); err != nil {
 			t.Fatalf("consumeTraces() error = %v", err)
 		}
+		waitUntil(t, exp.projectionIdle)
 		if got := len(queuedRecords(exp.actions)) + len(queuedRecords(exp.transcripts)); got != 0 {
 			t.Fatalf("queued records = %d, want 0", got)
 		}
@@ -148,10 +153,37 @@ func TestConsumeTracesContainsProjectionAndQueueLoss(t *testing.T) {
 		if err := exp.consumeTraces(context.Background(), eligibleTestTraces("secret")); err != nil {
 			t.Fatalf("consumeTraces() error = %v", err)
 		}
+		waitUntil(t, exp.projectionIdle)
 		if got := len(queuedRecords(exp.actions)) + len(queuedRecords(exp.transcripts)); got != before {
 			t.Fatalf("queued records = %d, want unchanged %d", got, before)
 		}
 	})
+}
+func TestInvalidEnvelopeLogsOnlyBoundedReason(t *testing.T) {
+	core, observed := observer.New(zap.ErrorLevel)
+	exp := newTestAgenticExporter(t, validTestConfig(t), zap.New(core), noop.NewMeterProvider())
+	traces := eligibleTestTraces("secret")
+	traces.ResourceSpans().At(0).ScopeSpans().At(0).Spans().At(0).SetTraceID(pcommon.TraceID{})
+	if err := exp.consumeTraces(context.Background(), traces); err != nil {
+		t.Fatalf("consumeTraces() error = %v", err)
+	}
+	waitUntil(t, exp.projectionIdle)
+
+	entries := observed.All()
+	if len(entries) != 3 {
+		t.Fatalf("error logs = %d, want one per invalid atom", len(entries))
+	}
+	for _, entry := range entries {
+		if entry.Message != "agentic exporter rejected candidate" {
+			t.Fatalf("error message = %q", entry.Message)
+		}
+		if got := entry.ContextMap()["reason"]; got != string(rejectInvalidEnvelope) {
+			t.Fatalf("error reason = %v, want %q", got, rejectInvalidEnvelope)
+		}
+		if len(entry.Context) != 1 {
+			t.Fatalf("error fields = %v, want only reason", entry.Context)
+		}
+	}
 }
 
 func TestExporterLifecycleContainsFilesystemLossAndLogsNoContent(t *testing.T) {
@@ -173,6 +205,7 @@ func TestExporterLifecycleContainsFilesystemLossAndLogsNoContent(t *testing.T) {
 	if err := exp.consumeTraces(context.Background(), eligibleTestTraces("unique-pdata-secret")); err != nil {
 		t.Fatalf("consumeTraces() error = %v", err)
 	}
+	waitUntil(t, exp.projectionIdle)
 	ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond)
 	defer cancel()
 	if err := exp.shutdown(ctx); err != nil {
@@ -197,6 +230,23 @@ func TestExporterLifecycleContainsFilesystemLossAndLogsNoContent(t *testing.T) {
 				t.Errorf("log field %q is not bounded", field.Key)
 			}
 		}
+	}
+}
+
+func TestExporterShutdownIsIdempotent(t *testing.T) {
+	exp := newTestAgenticExporter(t, validTestConfig(t), zap.NewNop(), noop.NewMeterProvider())
+	if err := exp.start(context.Background(), nil); err != nil {
+		t.Fatalf("start() error = %v", err)
+	}
+	firstCtx, firstCancel := context.WithTimeout(context.Background(), time.Second)
+	defer firstCancel()
+	if err := exp.shutdown(firstCtx); err != nil {
+		t.Fatalf("first shutdown() error = %v", err)
+	}
+	secondCtx, secondCancel := context.WithTimeout(context.Background(), time.Second)
+	defer secondCancel()
+	if err := exp.shutdown(secondCtx); err != nil {
+		t.Fatalf("second shutdown() error = %v", err)
 	}
 }
 
@@ -240,7 +290,10 @@ func newTestAgenticExporter(
 	if err != nil {
 		t.Fatalf("newAgenticExporter() error = %v", err)
 	}
-	t.Cleanup(exp.telemetry.close)
+	if exp.enabled {
+		exp.startProjection()
+	}
+	t.Cleanup(func() { _ = exp.shutdown(context.Background()) })
 	return exp
 }
 

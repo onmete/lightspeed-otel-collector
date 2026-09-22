@@ -28,6 +28,7 @@ const (
 	rejectInvalidPhase       rejectionReason = "missing_or_invalid_phase"
 	rejectInvalidEnvelope    rejectionReason = "invalid_envelope"
 	rejectQueueFull          rejectionReason = "queue_full"
+	rejectShutdown           rejectionReason = "shutdown_deadline"
 )
 
 type spanContext struct {

@@ -8,6 +8,7 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
+	"go.opentelemetry.io/otel/trace"
 )
 
 func TestTelemetryContract(t *testing.T) {
@@ -179,4 +180,49 @@ func metricAttributeSets(data metricdata.Aggregation) []attribute.Set {
 		}
 	}
 	return sets
+}
+func TestTelemetryRecordsWithoutTraceExemplars(t *testing.T) {
+	reader := sdkmetric.NewManualReader()
+	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	t.Cleanup(func() { _ = provider.Shutdown(context.Background()) })
+
+	tel, err := newTelemetry(component.TelemetrySettings{MeterProvider: provider})
+	if err != nil {
+		t.Fatalf("newTelemetry() error = %v", err)
+	}
+	t.Cleanup(tel.close)
+
+	traceContext := trace.NewSpanContext(trace.SpanContextConfig{
+		TraceID:    trace.TraceID{1},
+		SpanID:     trace.SpanID{2},
+		TraceFlags: trace.FlagsSampled,
+	})
+	ctx := trace.ContextWithSpanContext(context.Background(), traceContext)
+	tel.recordCandidate(ctx, candidateAction, recordSpan, "lightspeed-agentic-operator", 37)
+	tel.recordRejection(ctx, candidateTranscript, recordSpanEvent, "", rejectQueueFull)
+	tel.recordPublished(ctx, candidateAction, 1, 37)
+	tel.recordFileOperationFailure(ctx, candidateTranscript, opRename)
+
+	var collected metricdata.ResourceMetrics
+	if err := reader.Collect(context.Background(), &collected); err != nil {
+		t.Fatalf("Collect() error = %v", err)
+	}
+	for _, scope := range collected.ScopeMetrics {
+		for _, measured := range scope.Metrics {
+			switch points := measured.Data.(type) {
+			case metricdata.Sum[int64]:
+				for _, point := range points.DataPoints {
+					if len(point.Exemplars) != 0 {
+						t.Fatalf("%s emitted trace exemplars: %+v", measured.Name, point.Exemplars)
+					}
+				}
+			case metricdata.Histogram[int64]:
+				for _, point := range points.DataPoints {
+					if len(point.Exemplars) != 0 {
+						t.Fatalf("%s emitted trace exemplars: %+v", measured.Name, point.Exemplars)
+					}
+				}
+			}
+		}
+	}
 }

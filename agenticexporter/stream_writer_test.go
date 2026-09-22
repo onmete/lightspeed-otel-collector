@@ -80,6 +80,67 @@ func TestStreamWriterPublishCleanupAndImmutableInput(t *testing.T) {
 		t.Fatalf("unrelated ready file changed: %q", got)
 	}
 }
+func TestStreamWriterSharedSpoolPermissions(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "stream")
+	published := make(chan struct{}, 1)
+	w := newStreamWriter(candidateAction, dir, 64)
+	w.maxFileBytes = 1
+	w.callbacks.published = func(candidateType, int64, int64) { published <- struct{}{} }
+	if err := w.start(context.Background()); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	directoryInfo, err := os.Stat(dir)
+	if err != nil {
+		t.Fatalf("Stat(directory): %v", err)
+	}
+	if got := directoryInfo.Mode().Perm(); got != 0o770 {
+		t.Fatalf("directory permissions = %o, want 770", got)
+	}
+	if directoryInfo.Mode()&fs.ModeSetgid == 0 {
+		t.Fatal("spool directory is not setgid")
+	}
+
+	if !w.tryEnqueue([]byte("record\n")) {
+		t.Fatal("record rejected")
+	}
+	waitSignal(t, published)
+	ready := readyFiles(t, dir)
+	if len(ready) != 1 {
+		t.Fatalf("ready files = %v", ready)
+	}
+	fileInfo, err := os.Stat(filepath.Join(dir, ready[0]))
+	if err != nil {
+		t.Fatalf("Stat(ready file): %v", err)
+	}
+	if got := fileInfo.Mode().Perm(); got != 0o660 {
+		t.Fatalf("ready file permissions = %o, want 660", got)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	w.shutdown(ctx)
+}
+
+func TestOSFileOpsMkdirAllPreservesExistingDirectory(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "stream")
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatalf("Mkdir: %v", err)
+	}
+
+	if err := (osFileOps{}).mkdirAll(dir, 0o770|fs.ModeSetgid); err != nil {
+		t.Fatalf("mkdirAll: %v", err)
+	}
+	info, err := os.Stat(dir)
+	if err != nil {
+		t.Fatalf("Stat: %v", err)
+	}
+	if got := info.Mode().Perm(); got != 0o700 {
+		t.Fatalf("existing directory permissions = %o, want 700", got)
+	}
+	if info.Mode()&fs.ModeSetgid != 0 {
+		t.Fatal("existing directory unexpectedly changed to setgid")
+	}
+}
 
 func TestStreamWriterAdmissionAndOversizedException(t *testing.T) {
 	w := newStreamWriter(candidateAction, t.TempDir(), 8)
@@ -119,8 +180,7 @@ func TestStreamWriterTimerShutdownAndEmptySuppression(t *testing.T) {
 		t.Fatal("enqueue rejected")
 	}
 	waitUntil(t, func() bool { return w.snapshot().openBatchRecords == 1 && clock.hasActiveTimer() })
-	clock.advance(30 * time.Second)
-	waitSignal(t, published)
+	advanceClockUntilSignal(t, clock, published, time.Second)
 
 	if !w.tryEnqueue([]byte("two\n")) {
 		t.Fatal("enqueue rejected")
@@ -195,6 +255,33 @@ func TestStreamWriterFailureRecoveryMatrix(t *testing.T) {
 			w.shutdown(context.Background())
 		})
 	}
+}
+
+func TestStreamWriterChmodFailureRemovesOwnedTemp(t *testing.T) {
+	dir := t.TempDir()
+	ops := &faultFileOps{base: osFileOps{}, chmodFailures: 1, failures: map[fileOperation]int{}}
+	w := newStreamWriter(candidateAction, dir, 64)
+	w.ops = ops
+	_ = w.start(context.Background())
+	if !w.tryEnqueue([]byte("abc\n")) {
+		t.Fatal("enqueue rejected")
+	}
+	waitUntil(t, func() bool {
+		snapshot := w.snapshot()
+		return snapshot.state == streamDegraded && snapshot.operationFailures[opOpen] == 1
+	})
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if canonicalTmpName.MatchString(entry.Name()) {
+			t.Fatalf("owned temp file remained after chmod failure: %s", entry.Name())
+		}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	w.shutdown(ctx)
 }
 
 func TestStreamWriterRemoveFailureBlocksNewTemp(t *testing.T) {
@@ -302,6 +389,53 @@ func TestStreamWriterRecoveryBackoffCapsAndSuppressesRepeatedEdges(t *testing.T)
 		t.Fatalf("degraded state edges = %d, want 1", degradedEdges)
 	}
 }
+func TestStreamWriterRecoveryPreservesBatchAge(t *testing.T) {
+	dir := t.TempDir()
+	clock := newManualClock()
+	ops := &faultFileOps{base: osFileOps{}, failures: map[fileOperation]int{}}
+	published := make(chan struct{}, 1)
+	w := newStreamWriter(candidateAction, dir, 64)
+	w.ops, w.clock, w.maxFileBytes, w.maxBatchAge = ops, clock, 64, 30*time.Second
+	w.callbacks.published = func(candidateType, int64, int64) { published <- struct{}{} }
+	if err := w.start(context.Background()); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	if !w.tryEnqueue([]byte("one\n")) {
+		t.Fatal("first record rejected")
+	}
+	waitUntil(t, func() bool { return w.snapshot().openBatchBytes == 4 })
+	clock.advance(20 * time.Second)
+	ops.mu.Lock()
+	ops.failures[opWrite] = 1
+	ops.mu.Unlock()
+	beforeResets := clock.resetCount()
+	if !w.tryEnqueue([]byte("two\n")) {
+		t.Fatal("second record rejected")
+	}
+	waitUntil(t, func() bool {
+		return w.snapshot().state == streamDegraded && clock.resetCount() > beforeResets
+	})
+	if got := w.snapshot().openBatchAge; got < 20*time.Second {
+		t.Fatalf("batch age after failure = %v, want at least 20s", got)
+	}
+
+	deadline := time.Now().Add(time.Second)
+	for {
+		snapshot := w.snapshot()
+		if snapshot.state == streamHealthy && snapshot.openBatchBytes == 8 {
+			break
+		}
+		clock.advance(recoveryInitialBackoff)
+		runtime.Gosched()
+		if time.Now().After(deadline) {
+			t.Fatalf("recovery did not become healthy: %+v", snapshot)
+		}
+	}
+	advanceClockUntilSignal(t, clock, published, 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	w.shutdown(ctx)
+}
 
 func TestStreamWriterReadyBacklogNoticesExternalDeletion(t *testing.T) {
 	dir := t.TempDir()
@@ -334,6 +468,7 @@ type faultFileOps struct {
 	base          fileOps
 	mu            sync.Mutex
 	failures      map[fileOperation]int
+	chmodFailures int
 	opens, closes int
 	renames       []string
 }
@@ -366,6 +501,16 @@ func (o *faultFileOps) openExclusive(path string, mode fs.FileMode) (batchFile, 
 	o.mu.Unlock()
 	return &faultBatchFile{BatchFile: file, owner: o}, nil
 }
+func (o *faultFileOps) chmod(path string, mode fs.FileMode) error {
+	o.mu.Lock()
+	if o.chmodFailures != 0 {
+		o.chmodFailures--
+		o.mu.Unlock()
+		return errors.New("injected chmod")
+	}
+	o.mu.Unlock()
+	return o.base.chmod(path, mode)
+}
 func (o *faultFileOps) rename(oldPath, newPath string) error {
 	o.mu.Lock()
 	o.renames = append(o.renames, oldPath)
@@ -382,6 +527,7 @@ func (o *faultFileOps) remove(path string) error {
 	return o.base.remove(path)
 }
 func (o *faultFileOps) readDir(path string) ([]fs.DirEntry, error) { return o.base.readDir(path) }
+func (o *faultFileOps) stat(path string) (fs.FileInfo, error)      { return o.base.stat(path) }
 func (o *faultFileOps) openCount() int                             { o.mu.Lock(); defer o.mu.Unlock(); return o.opens }
 func (o *faultFileOps) closeCount() int                            { o.mu.Lock(); defer o.mu.Unlock(); return o.closes }
 func (o *faultFileOps) renameSources() []string {
@@ -416,9 +562,10 @@ func (f *faultBatchFile) Close() error {
 }
 
 type manualClock struct {
-	mu      sync.Mutex
-	nowTime time.Time
-	timers  []*manualTimer
+	mu          sync.Mutex
+	nowTime     time.Time
+	timers      []*manualTimer
+	timerResets int
 }
 
 type manualTimer struct {
@@ -464,6 +611,11 @@ func (c *manualClock) hasActiveTimer() bool {
 	}
 	return false
 }
+func (c *manualClock) resetCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.timerResets
+}
 func (t *manualTimer) C() <-chan time.Time { return t.ch }
 func (t *manualTimer) Reset(d time.Duration) {
 	t.clock.mu.Lock()
@@ -473,6 +625,7 @@ func (t *manualTimer) Reset(d time.Duration) {
 	}
 	t.due = t.clock.nowTime.Add(d)
 	t.active = true
+	t.clock.timerResets++
 	t.clock.mu.Unlock()
 }
 func (t *manualTimer) Stop() { t.clock.mu.Lock(); t.active = false; t.clock.mu.Unlock() }
@@ -514,5 +667,21 @@ func waitUntil(t *testing.T, condition func() bool) {
 			t.Fatal("condition not reached")
 		}
 		runtime.Gosched()
+	}
+}
+func advanceClockUntilSignal(t *testing.T, clock *manualClock, published <-chan struct{}, step time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for {
+		select {
+		case <-published:
+			return
+		default:
+		}
+		clock.advance(step)
+		runtime.Gosched()
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for manual-clock callback")
+		}
 	}
 }

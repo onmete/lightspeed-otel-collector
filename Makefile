@@ -62,9 +62,12 @@ vet: ## Run go vet.
 
 GENDIR = cmd/otelcol-lightspeed
 
+# Keep checked-in dependency pins stable; OCB can otherwise rewrite them.
+OCB_MODULE_FLAGS ?= --skip-get-modules
+
 .PHONY: generate
 generate: ocb ## Generate collector source code (commit for hermetic CI builds).
-	$(OCB) --skip-compilation --config=builder-config.yaml
+	$(OCB) --skip-compilation $(OCB_MODULE_FLAGS) --config=builder-config.yaml
 	@echo "Generated source in $(GENDIR)/ — commit this directory."
 
 .PHONY: verify-generate
@@ -77,7 +80,7 @@ verify-generate: generate ## Verify generated source is up to date.
 
 .PHONY: build
 build: ocb ## Build the collector binary.
-	$(OCB) --config=builder-config.yaml
+	$(OCB) $(OCB_MODULE_FLAGS) --config=builder-config.yaml
 
 .PHONY: run
 run: build ## Build and run the collector locally.

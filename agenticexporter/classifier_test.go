@@ -42,6 +42,7 @@ func TestClassifyEnumValues(t *testing.T) {
 		rejectInvalidPhase:       "missing_or_invalid_phase",
 		rejectInvalidEnvelope:    "invalid_envelope",
 		rejectQueueFull:          "queue_full",
+		rejectShutdown:           "shutdown_deadline",
 	}
 	for value, want := range rejectionValues {
 		if string(value) != want {

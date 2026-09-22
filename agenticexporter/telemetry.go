@@ -8,7 +8,15 @@ import (
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/trace"
 )
+
+func metricContextWithoutSpan(ctx context.Context) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return trace.ContextWithSpanContext(ctx, trace.SpanContext{})
+}
 
 const meterScope = "github.com/openshift/lightspeed-otel-collector/agenticexporter"
 
@@ -209,11 +217,11 @@ func (t *telemetry) recordCandidate(
 	serviceName string,
 	size int,
 ) {
+	ctx = metricContextWithoutSpan(ctx)
 	attrs := recordAttributes(candidate, kind, serviceName)
 	t.candidates.Add(ctx, 1, metric.WithAttributes(attrs...))
 	t.recordSize.Record(ctx, int64(size), metric.WithAttributes(attrs...))
 }
-
 func (t *telemetry) recordRejection(
 	ctx context.Context,
 	candidate candidateType,
@@ -221,6 +229,7 @@ func (t *telemetry) recordRejection(
 	serviceName string,
 	reason rejectionReason,
 ) {
+	ctx = metricContextWithoutSpan(ctx)
 	attrs := []attribute.KeyValue{
 		attribute.String("candidate_type", string(candidate)),
 		attribute.String("record_kind", string(kind)),
@@ -233,6 +242,7 @@ func (t *telemetry) recordRejection(
 }
 
 func (t *telemetry) recordPublished(ctx context.Context, candidate candidateType, records, bytes int64) {
+	ctx = metricContextWithoutSpan(ctx)
 	attrs := metric.WithAttributes(attribute.String("candidate_type", string(candidate)))
 	t.readyFilesCreated.Add(ctx, 1, attrs)
 	t.readyRecordsCreated.Add(ctx, records, attrs)
@@ -240,6 +250,7 @@ func (t *telemetry) recordPublished(ctx context.Context, candidate candidateType
 }
 
 func (t *telemetry) recordFileOperationFailure(ctx context.Context, candidate candidateType, operation fileOperation) {
+	ctx = metricContextWithoutSpan(ctx)
 	t.fileOperationFailures.Add(ctx, 1, metric.WithAttributes(
 		attribute.String("candidate_type", string(candidate)),
 		attribute.String("operation", string(operation)),
