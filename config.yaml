@@ -6,11 +6,13 @@ receivers:
     protocols:
       grpc:
         endpoint: 0.0.0.0:4317
+        max_recv_msg_size_mib: 20
         tls:
           cert_file: /var/run/secrets/serving-cert/tls.crt
           key_file: /var/run/secrets/serving-cert/tls.key
       http:
         endpoint: 0.0.0.0:4318
+        max_request_body_size: 20971520
         tls:
           cert_file: /var/run/secrets/serving-cert/tls.crt
           key_file: /var/run/secrets/serving-cert/tls.key
@@ -39,6 +41,11 @@ exporters:
       num_consumers: 4
       queue_size: 1000
       storage: file_storage
+
+  agentic:
+    actions_directory: /var/lib/lightspeed-data-collection/actions
+    transcripts_directory: /var/lib/lightspeed-data-collection/transcripts
+    max_backlog_bytes: 4194304
 
 extensions:
   health_check:
@@ -76,10 +83,10 @@ service:
       exporters: [postgres]
 
     # Accept traces so the OTLP receiver doesn't return UNIMPLEMENTED.
-    # No trace backend configured in simple mode — silently drop.
+    # Retain the nop sink while exporting agentic candidates as JSONL.
     traces:
       receivers: [otlp]
-      exporters: [nop]
+      exporters: [nop, agentic]
 
   telemetry:
     logs:

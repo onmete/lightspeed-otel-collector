@@ -24,7 +24,7 @@ The Lightspeed OTel Collector is a custom OpenTelemetry Collector distribution t
 
 ### Agentic Data Collection
 
-10. Collector-local trace filtering, atom projection, and atomic file publication are specified in `what/agentic-data-collection.md`; the parent [`Agentic Data Collection`](../../../../.ai/spec/what/agentic-data-collection.md) specification owns the end-to-end contract. `[PLANNED: OLS-3569]`
+10. Collector-local trace filtering, atom projection, bounded per-stream queues, and atomic file publication are implemented in `what/agentic-data-collection.md`; the parent [`Agentic Data Collection`](../../../../.ai/spec/what/agentic-data-collection.md) specification owns the end-to-end contract and cross-repository rollout. `[IMPLEMENTED: OLS-4248]` `[IMPLEMENTED: OLS-4249]`
 
 ### Resilience
 
@@ -36,11 +36,11 @@ The Lightspeed OTel Collector is a custom OpenTelemetry Collector distribution t
 
 | Field/Flag | Type | Default | Description |
 |---|---|---|---|
-| Configuration follows standard OTel Collector YAML config — receivers, processors, exporters, pipelines. Configuration is documented per-component: see `what/collector.md` for Collector configuration, `what/postgres-exporter.md` for the PostgreSQL exporter, and `what/agentic-data-collection.md` for planned Agentic Collector mechanics. ||||
+| Configuration follows standard OTel Collector YAML config — receivers, processors, exporters, pipelines. Configuration is documented per-component: see `what/collector.md` for Collector configuration, `what/postgres-exporter.md` for the PostgreSQL exporter, and `what/agentic-data-collection.md` for implemented Collector-local Agentic mechanics. ||||
 
 ## Planned Changes
 
 | Ticket | Summary |
 |---|---|
-| — | Initial implementation — all rules above are planned |
-| OLS-3569 | Collector-local Agentic trace filtering and atomic JSONL publication |
+| OLS-4248 | Collector-local Agentic classification, projection, telemetry, and exporter integration |
+| OLS-4249 | Collector-local bounded Action/Transcript spooling and recovery |

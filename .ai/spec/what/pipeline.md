@@ -29,11 +29,11 @@ The data pipeline: how telemetry flows from OLS components through the collector
 
 ### Agentic Product-Data Branch
 
-12. The planned trace-to-file branch is specified in `what/agentic-data-collection.md`; the parent [`Agentic Data Collection`](../../../../.ai/spec/what/agentic-data-collection.md) specification owns its accepted cross-repository interface and product semantics. `[PLANNED: OLS-3569]`
+12. The trace pipeline MAY fan out the original OTLP traces to the local `agentic` exporter. The exporter classifies eligible atoms into Action and Transcript JSONL streams without mutating or back-pressuring other destinations. Collector-local behavior is implemented in `what/agentic-data-collection.md`; operator gating, upload, and downstream product semantics remain owned by the parent specification. `[IMPLEMENTED: OLS-4248]` `[IMPLEMENTED: OLS-4249]`
 
 ## Planned Changes
 
 | Ticket | Summary |
 |---|---|
-| — | All rules are planned — initial design |
-| OLS-3569 | Trace-only Agentic candidate classification and JSONL spool branch |
+| OLS-4248 | Collector-local Agentic trace classification, projection, telemetry, and exporter integration |
+| OLS-4249 | Independent bounded Agentic Action/Transcript JSONL spooling and recovery |

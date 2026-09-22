@@ -18,6 +18,10 @@ exporters:
   - gomod: github.com/openshift/lightspeed-otel-collector/postgresexporter v0.0.0
     path: ./postgresexporter
 
+  # Agentic exporter — writes candidate action and transcript trace data as JSONL.
+  - gomod: github.com/openshift/lightspeed-otel-collector/agenticexporter v0.0.0
+    path: ./agenticexporter
+
   # Standard OTLP exporter — forwards telemetry to downstream collectors via gRPC.
   - gomod: go.opentelemetry.io/collector/exporter/otlpexporter v0.159.0
 

@@ -1,10 +1,13 @@
 # OpenTelemetry Collector — OpenShift Lightspeed
 
 Custom OpenTelemetry Collector distribution for OpenShift Lightspeed.
-Receives OTLP logs over TLS and writes them to PostgreSQL.
+Receives OTLP logs over TLS and writes them to PostgreSQL; eligible Agentic
+traces are also fanned out into bounded Action and Transcript JSONL spools.
 
 ```
 App --OTLP/TLS--> receiver --> batch processor --> postgresexporter --> PostgreSQL (TLS)
+                                  \
+                                   \--> agentic exporter --> Action/Transcript JSONL
 
 App ---------- GET/DELETE /api/v1/logs (HTTPS) --> postgres_admin --> PostgreSQL (TLS)
 ```
@@ -29,6 +32,13 @@ App ---------- GET/DELETE /api/v1/logs (HTTPS) --> postgres_admin --> PostgreSQL
 │   ├── telemetry.go                 # Internal metrics (insert duration, pool stats)
 │   ├── config_test.go               # Config validation tests
 │   └── exporter_test.go             # Exporter logic tests (pgxmock)
+├── agenticexporter/
+│   ├── classifier.go              # Span eligibility and atom classification
+│   ├── projector.go               # Schema-1.0 OTLP projection
+│   ├── stream_writer.go           # Bounded atomic JSONL spooling and recovery
+│   ├── telemetry.go               # Bounded metrics and content-free state logs
+│   ├── exporter.go / factory.go   # Collector trace exporter lifecycle
+│   └── *_test.go                  # Contract, lifecycle, and filesystem tests
 └── extension/
     ├── postgresadmin/
     │   ├── go.mod                   # Go module (pgx/v5)
@@ -67,6 +77,34 @@ make test
 # Regenerate source after changing builder-config.yaml
 make generate
 ```
+
+## Agentic Candidate JSONL
+
+The `agentic` trace exporter accepts only spans from
+`lightspeed-agentic-operator` and `lightspeed-agentic-sandbox` whose span
+attributes contain a valid `agenticrun.uid` and phase. Each eligible span is
+an Action candidate. Attached events are classified independently and
+exclusively as Transcript or Action candidates, retaining their original
+event indexes and full OTLP value types.
+
+The exporter writes immutable, compact schema-1.0 JSONL files to:
+
+```
+/var/lib/lightspeed-data-collection/actions
+/var/lib/lightspeed-data-collection/transcripts
+```
+
+Each stream has an independent 4 MiB unpublished-byte budget by default,
+publishes complete UUIDv4 batches at 1 MiB or 30 seconds, and uses atomic
+same-directory rename. Configuration and filesystem failures are best effort:
+they disable or degrade only this product-data branch, preserve existing
+ready files, and leave Collector health and unrelated pipelines available.
+The operator owns the dedicated finite-size `emptyDir`; an upload sidecar
+owns ready-file deletion. Candidate upload, retention, and downstream
+transformation are outside this repository.
+
+Reference configuration is in [`config.yaml`](config.yaml) and
+[`config-router.yaml`](config-router.yaml).
 
 ## Log Record Schema
 
