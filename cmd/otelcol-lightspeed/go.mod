@@ -8,6 +8,7 @@ require (
 	github.com/open-telemetry/opentelemetry-collector-contrib/connector/routingconnector v0.159.0
 	github.com/open-telemetry/opentelemetry-collector-contrib/extension/healthcheckextension v0.159.0
 	github.com/open-telemetry/opentelemetry-collector-contrib/extension/storage/filestorage v0.159.0
+	github.com/openshift/lightspeed-otel-collector/agenticexporter v0.0.0
 	github.com/openshift/lightspeed-otel-collector/extension/httpsmetrics v0.0.0
 	github.com/openshift/lightspeed-otel-collector/extension/postgresadmin v0.0.0
 	github.com/openshift/lightspeed-otel-collector/postgresexporter v0.0.0
@@ -228,3 +229,5 @@ replace github.com/openshift/lightspeed-otel-collector/extension/postgresadmin v
 replace github.com/openshift/lightspeed-otel-collector/extension/httpsmetrics v0.0.0 => ../../extension/httpsmetrics
 
 replace github.com/openshift/lightspeed-otel-collector/postgresexporter v0.0.0 => ../../postgresexporter
+
+replace github.com/openshift/lightspeed-otel-collector/agenticexporter v0.0.0 => ../../agenticexporter
