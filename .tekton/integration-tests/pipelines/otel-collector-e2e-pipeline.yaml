@@ -134,7 +134,7 @@ spec:
                 valueFrom:
                   fieldRef:
                     fieldPath: metadata.labels['appstudio.openshift.io/component']
-            image: registry.redhat.io/openshift4/ose-cli:v4.19
+            image: registry.redhat.io/openshift4/ose-cli-rhel9:v4.19
             script: |
               set -euo pipefail
               dnf -y install jq
@@ -176,7 +176,7 @@ spec:
                 value: "$(steps.extract-image.results.commit)"
               - name: TEST_NAMESPACE
                 value: "$(params.namespace)"
-            image: registry.redhat.io/openshift4/ose-cli:v4.19
+            image: registry.redhat.io/openshift4/ose-cli-rhel9:v4.19
             script: |
               set -euo pipefail
               dnf -y install git make golang
