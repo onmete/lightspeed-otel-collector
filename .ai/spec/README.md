@@ -23,15 +23,23 @@ AI agents. Content is optimized for precision and machine consumption.
 | Understand the system | `what/system-overview.md` |
 | Understand the data pipeline | `what/pipeline.md` |
 | HTTPS Prometheus metrics (OLS-3656) | `what/https-metrics.md` |
-| Understand the Collector-local Agentic span eligibility and native OTLP JSONL spool | `what/agentic-data-collection.md` |
+| Understand Collector-local Agentic eligibility, private JSONL staging, and versioned array publication | `what/agentic-data-collection.md` |
 
-The Collector-local native OTLP JSONL implementation is complete; a freshly
-built binary passed healthy, invalid-configuration, and same-process-recovery
-smoke scenarios. The workspace parent spec and ADR 0043 still require the
-former Action/Transcript streams and custom envelope. Their owners,
-operator-generated configuration, and the ready-file consumer must coordinate
-updates before rollout. This Collector change alone does not authorize
-deployment.
+The Collector-local array-export contract is implemented. The 2026-10-01
+fresh-binary smoke exercised the 30-second time trigger, the >1 MiB size
+trigger, graceful shutdown, native typed span/event preservation, non-root
+same-process failure/recovery, and invalid-staging isolation. The generated
+production operator `agentic` stanza decoded with the real Collector
+`validate` command. This is Collector-local/configuration evidence, not cluster,
+uploader, or Dataverse-ingestion proof. The Collector does not implement an
+uploader, and this status does not authorize rollout. Previously published
+`.jsonl` and old Action/Transcript files are not automatically converted or
+deleted.
+
+The active mount contract is one whole-spool Collector mount at
+`/var/lib/lightspeed-data` with no `subPath`; see
+`what/agentic-data-collection.md` for the exact requirement. A future uploader
+MUST mount only the volume's `export` subpath at its pickup root.
 
 ## Conventions
 

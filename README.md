@@ -2,12 +2,12 @@
 
 Custom OpenTelemetry Collector distribution for OpenShift Lightspeed.
 Receives OTLP logs over TLS and writes them to PostgreSQL. The `agentic` trace
-exporter fans out eligible spans to one bounded, best-effort native OTLP JSONL
-spool.
+exporter fans out eligible spans to private JSONL staging and publishes complete
+native OTLP JSON arrays under `traces/v1/`.
 
 ```
 OTLP traces --> receiver --> existing trace exporter(s)
-                       \--> agentic exporter --> native OTLP JSONL (`traces/`)
+                       \--> agentic exporter --> private JSONL --> traces/v1/*.json
 OTLP logs ----> receiver --> postgresexporter --> PostgreSQL (TLS)
 
 App ---------- GET/DELETE /api/v1/logs (HTTPS) --> postgres_admin --> PostgreSQL (TLS)
@@ -35,9 +35,9 @@ App ---------- GET/DELETE /api/v1/logs (HTTPS) --> postgres_admin --> PostgreSQL
 │   └── exporter_test.go             # Exporter logic tests (pgxmock)
 ├── agenticexporter/
 │   ├── classifier.go              # Per-span service and correlation eligibility
-│   ├── stream_writer.go           # Single bounded atomic JSONL spool and recovery
+│   ├── stream_writer.go           # Private JSONL staging, array conversion and recovery
 │   ├── telemetry.go               # Document-level metrics and content-free state logs
-│   ├── exporter.go / factory.go   # Native contextualized OTLP span documents
+│   ├── exporter.go / factory.go   # Native contextualized OTLP array elements
 │   ├── *_test.go                  # Contract, lifecycle, and filesystem tests
 └── extension/
     ├── postgresadmin/
@@ -65,7 +65,7 @@ App ---------- GET/DELETE /api/v1/logs (HTTPS) --> postgres_admin --> PostgreSQL
 ```bash
 # Prerequisites: Go 1.26.0+ for the Collector build; Go 1.26.5+ for E2E; PostgreSQL
 
-# Build the collector binary (uses pre-generated source in cmd/otelcol-lightspeed/)
+# Build the local collector binary with OCB using builder-config.yaml.
 make build
 
 # Run locally
@@ -78,84 +78,141 @@ make test
 make generate
 ```
 
-## Agentic Native OTLP JSONL
+`make build` runs OCB. The Dockerfile instead compiles the checked-in,
+OCB-generated Go source with `go build`; it does not run OCB.
 
-> **Collector-local status:** The freshly built binary passed healthy-output,
-> invalid-configuration-isolation, and same-process filesystem-recovery smoke
-> scenarios, including native span/event fidelity, full >1 MiB document
-> publication, independent debug delivery, and health. This proves local
-> Collector behavior only; it does not authorize integrated rollout (see
-> prerequisites below).
+## Agentic Native OTLP Array Export
 
-The Collector evaluates eligibility per span: `service.name` must be exactly
-`lightspeed-agentic-operator` or `lightspeed-agentic-sandbox`; the span itself
-must have a non-empty string `agenticrun.uid`, a valid `agenticrun.phase`
-(`analysis`, `approval`, `execution`, `verification`, `escalation`, or
-`terminal`), and non-empty trace and span IDs. No resource-attribute fallback
-is used. Every event attached to an eligible span remains nested in that span,
-regardless of event name; unknown and future operation/event names are kept.
-The Collector does not classify Action/Transcript candidates or inspect
-embedded content strings.
+> **Collector-local evidence (2026-10-01):** A freshly built binary published
+> arrays through the 30-second time trigger, the >1 MiB size trigger, and
+> graceful shutdown. Native span/event evidence and typed values were preserved.
+> A non-root permission failure retained the sealed source and recovered a
+> byte-exact array in the same process after permissions were restored; deleting
+> a published file did not make the Collector recreate it. An invalid
+> overlapping staging path disabled only this exporter while health and the
+> debug destination remained available. The generated production operator
+> `agentic` stanza decoded with the real Collector `validate` command. These
+> checks do not prove cluster deployment, uploader behavior, or downstream
+> Dataverse ingestion, and do not authorize rollout.
 
-Every published document contains exactly one eligible span and all of its
-attached events. The Collector MUST NOT emit detached event records or split
-or truncate a span across multiple lines/documents.
-Bounded queue loss, encoding/filesystem failure, or a shutdown deadline may
-leave an eligible span without a ready document.
+The Agentic branch consumes traces only. Eligibility is evaluated per span:
+`service.name` must be exactly `lightspeed-agentic-operator` or
+`lightspeed-agentic-sandbox`; the span itself must have a non-empty string
+`agenticrun.uid`, a valid `agenticrun.phase` (`analysis`, `approval`,
+`execution`, `verification`, `escalation`, or `terminal`), and non-empty trace
+and span IDs. There is no resource-attribute fallback. Each eligible span is
+one native contextualized OTLP JSON object under
+`resourceSpans[] -> scopeSpans[] -> spans[]`, retaining original typed values,
+resource/scope context, and all attached events. The Collector does not
+classify Action/Transcript candidates or inspect embedded content strings.
 
-The sole spool configuration is:
+The private staging source is JSONL: one unchanged object plus LF per span.
+Publication streams those objects into a compact top-level JSON array, removing
+the source LFs and inserting commas and brackets. Each array element is one
+eligible span; there is no custom wrapper, `schema_version`, or trailing comma.
+Files may contain different services, runs, phases, and traces; neither file
+nor array-element order is execution order. `v1` versions this packaging
+contract, not OTLP.
+
+The configuration is:
 
 ```yaml
 agentic:
-  directory: /var/lib/lightspeed-data-collection/traces
+  directory: /var/lib/lightspeed-data/export/traces
+  staging_directory: /var/lib/lightspeed-data/staging
   max_backlog_bytes: 8388608
 ```
 
-The shared 8 MiB unpublished-encoded-byte budget is applied once. A separate
-64-job bound limits queued contextualized spans; it is a count bound, not a
-byte budget. When the writer has no unpublished bytes, it may admit one whole
-document larger than the byte budget, subject to the fixed record-size cap.
-Neither bound is a total process-memory or ready-file disk cap.
+`directory` is the unversioned export root; completed files are
+`<directory>/v1/<uuid>.json`. Private files remain under
+`staging_directory`:
 
-Each encoded native JSONL record is limited to **120,000,000 bytes**, including
-its final LF. The fixed guard measures the entire encoded document, not just
-its content strings or OTLP request size. A document at the limit is allowed;
-a larger document is rejected whole before writer admission, with one
-`record_too_large` rejection and no content logging, truncation, or splitting.
-The empty-backlog exception does not bypass this cap. Together with the
-unchanged 1 MiB rotation threshold, it keeps new ready files below
-121,048,576 bytes, safely below the 128 MB downstream raw-row ceiling.
-Existing ready files are immutable and are not rewritten by this guard.
-
-One writer publishes complete `.<uuid>.tmp` files by same-directory atomic
-rename to immutable `<uuid>.jsonl` files. It publishes at 1 MiB or within
-30 seconds of the first document; one complete document may cross the 1 MiB
-threshold. Filesystem recovery is bounded and best effort. Queue pressure,
-encoding/identity/size rejection, filesystem failure, or a shutdown deadline may
-lose a document, but this branch must not back-pressure or mutate traces sent
-to another configured destination. Atomic rename provides complete-file
-visibility, not an fsync or crash-durability guarantee. On the pod-local
-spool volume, ready files are retry buffers, not durable retention; pod
-replacement or volume removal can lose unsent ready and in-progress data.
-
-Collector telemetry counts one document per span, including its nested events;
-events are not separate records or counts. Existing metric names are retained,
-but `candidate_type`, `record_kind`, and `stream` labels are removed. Logs and
-metrics remain bounded and content-free.
-
-When a consumer receives a whole file as one raw value, it must split on LF,
-parse each complete line as native OTLP JSON, and then flatten it. Inspect
-copied complete ready files locally with:
-
-```bash
-jq -c '.resourceSpans[] | .scopeSpans[] | .spans[] | {traceId, spanId, parentSpanId, name, attributes, events}' /local/copied/traces/*.jsonl
+```text
+.<uuid>.jsonl.tmp    # active private source
+<uuid>.jsonl         # sealed source
+.<uuid>.json.tmp     # private array candidate
 ```
 
-**Rollout prerequisite:** The workspace [parent collection specification](../.ai/spec/what/agentic-data-collection.md) and [ADR 0043](../.ai/spec/decisions/0043-agentic-data-collection-via-otel.md) still require the old Action/Transcript split and custom envelope. Their owners, the operator-generated configuration, and the ready-file consumer must be updated together before rollout. The consumer must read ready `.jsonl` files under `traces/`, not temporary files; owners must also decide how to preserve or drain existing `actions/` and `transcripts/` files and update dashboards using removed labels. External inspection scripts are not migrated here.
+Staging must be outside the entire future uploader pickup tree, not merely
+outside `traces/` or hidden by a filename. The exporter checks that both
+configured roots are absolute and do not overlap, but cannot infer the full
+pickup tree or validate mount identity. The Collector must mount the whole
+existing spool exactly once at `/var/lib/lightspeed-data`, with no `subPath`;
+staging and export then remain beneath one mount so atomic `rename` can succeed.
+Separate Collector `subPath` mounts can fail with `EXDEV` even when they refer
+to the same volume. A future uploader is separate: it must mount only the
+volume's `export` subpath at its pickup root, so it cannot see staging. No
+uploader is implemented in the Collector pod.
 
-Reference configurations are in [`config.yaml`](config.yaml) and
-[`config-router.yaml`](config-router.yaml). The downstream owner handles
-classification, deduplication, reconstruction, and logical models.
+The asynchronous queue is bounded to 64 jobs. The shared 8 MiB unpublished
+byte budget counts complete JSONL source records (including LF) queued or in
+the active batch until publication; when it is zero, one complete document
+larger than the budget may be admitted. Neither bound is a total process-memory
+or disk quota.
+
+Each source record is limited to **120,000,000 bytes**, including its final LF;
+equality passes, and a larger record is rejected whole. A non-empty batch
+publishes at 1,048,576 source bytes or within 30 seconds of its first
+successfully written complete record. One complete record may cross the 1 MiB
+threshold. The final array is exactly one byte larger than its JSONL source:
+the record LFs are replaced by commas and the array brackets. A separate
+exclusive guard requires every final file to be smaller than **128,000,000
+bytes**; with the existing record cap and rotation threshold, a new file is at
+most 121,048,576 bytes.
+
+During conversion, the sealed source and candidate array coexist in staging;
+budget disk for roughly twice one unpublished batch, plus already published
+array backlog. The 8 MiB unpublished-byte budget does not cap spool-disk usage,
+so deployments need a finite volume sized for this overhead and backlog.
+
+Filesystem failures degrade only this best-effort branch and use capped
+exponential backoff (1-second initial, 30-second maximum). A partial source
+write or failed close removes only the broken private temporary file and
+rebuilds from retained complete records. A failed source-sealing rename keeps
+the closed source for retry. Read/conversion failures retain the sealed source
+and clean only a broken array candidate; a failed final rename retains the
+sealed source and closed candidate array for retry, with no copy fallback.
+After a successful final rename, publication is committed once. If private
+source cleanup then fails, recovery retries only that cleanup and never
+republishes the array. If the shutdown deadline expires during conversion, the
+writer closes private handles, preserves the sealed source for inspection, and
+does not publish that batch later. This branch does not back-pressure other
+trace destinations.
+
+Shutdown waits for the writer to finish before closing exporter telemetry.
+The deadline cancels conversion and prevents late publication, but a synchronous
+filesystem call or close already in progress can delay completion beyond it.
+
+Atomic rename gives complete-file visibility, not crash durability: there is no
+`fsync`, restart replay, journal, or exactly-once guarantee, and pod-local
+volume removal can lose files. Startup removes only recognized private source
+and array-candidate temp names; it preserves complete sealed JSONL sources for
+inspection but does not replay them. The Collector does not enumerate, read, stat, or track
+published arrays after rename, and does not recreate a published file removed
+by a consumer.
+
+Admission counters count span documents once. The record-size histogram and
+unpublished/open-batch byte gauges describe private JSONL source bytes,
+including LF. The `otelcol_agentic_exporter_ready_files_created`,
+`otelcol_agentic_exporter_ready_records_created`, and
+`otelcol_agentic_exporter_ready_bytes_created` instruments are cumulative
+publication counters; ready bytes are the final array size. The Collector
+exposes no public-file backlog gauges. Labels and logs remain bounded and
+content-free.
+
+Downstream consumers must parse each complete `.json` top-level array before
+traversing native OTLP hierarchy; they must not split the public file on LF.
+Dataverse owns parsing, flattening, classification, deduplication, joins, and
+run/phase reconstruction. This Collector change does not implement an uploader
+or prove downstream ingestion. Inspect copied output with:
+
+```bash
+jq -c '.[] | .resourceSpans[] | .scopeSpans[] | .spans[] | {traceId, spanId, parentSpanId, name, attributes, events}' /local/copied/traces/v1/*.json
+```
+
+Previously published `.jsonl` files and old `actions/` or `transcripts/` files
+are not converted or deleted automatically; owners must drain or otherwise
+handle them before rollout.
 
 ## Log Record Schema
 
@@ -276,9 +333,9 @@ make docker-build VERSION=0.1.0
 
 ## PostgreSQL Log Delivery Durability
 
-This section applies only to OTLP logs sent to PostgreSQL. The Agentic JSONL
-spool is separate; its atomic rename is not an fsync or crash-durability
-guarantee.
+This section applies only to OTLP logs sent to PostgreSQL. The Agentic exporter
+uses private JSONL staging and publishes arrays; its atomic rename is not an
+fsync or crash-durability guarantee.
 
 | Failure scenario | What happens |
 |---|---|

@@ -37,8 +37,6 @@ type telemetry struct {
 	openBatchRecords    metric.Int64ObservableGauge
 	openBatchBytes      metric.Int64ObservableGauge
 	openBatchAge        metric.Float64ObservableGauge
-	readyBacklogFiles   metric.Int64ObservableGauge
-	readyBacklogBytes   metric.Int64ObservableGauge
 	streamState         metric.Int64ObservableGauge
 
 	registration metric.Registration
@@ -145,20 +143,6 @@ func newTelemetry(settings component.TelemetrySettings) (*telemetry, error) {
 	); err != nil {
 		return nil, err
 	}
-	if t.readyBacklogFiles, err = meter.Int64ObservableGauge(
-		"otelcol_agentic_exporter_ready_backlog_files",
-		metric.WithDescription("Ready files currently awaiting collection."),
-		metric.WithUnit("{files}"),
-	); err != nil {
-		return nil, err
-	}
-	if t.readyBacklogBytes, err = meter.Int64ObservableGauge(
-		"otelcol_agentic_exporter_ready_backlog_bytes",
-		metric.WithDescription("Bytes in ready files currently awaiting collection."),
-		metric.WithUnit("By"),
-	); err != nil {
-		return nil, err
-	}
 	if t.streamState, err = meter.Int64ObservableGauge(
 		"otelcol_agentic_exporter_stream_state",
 		metric.WithDescription("Current stream state: unavailable=0, healthy=1, degraded=2."),
@@ -185,8 +169,6 @@ func (t *telemetry) registerWriter(writer *streamWriter) error {
 		t.openBatchRecords,
 		t.openBatchBytes,
 		t.openBatchAge,
-		t.readyBacklogFiles,
-		t.readyBacklogBytes,
 		t.streamState,
 	)
 	if err != nil {
@@ -203,8 +185,6 @@ func (t *telemetry) observeSnapshot(observer metric.Observer, snapshot streamSna
 	observer.ObserveInt64(t.openBatchRecords, snapshot.openBatchRecords)
 	observer.ObserveInt64(t.openBatchBytes, snapshot.openBatchBytes)
 	observer.ObserveFloat64(t.openBatchAge, snapshot.openBatchAge.Seconds())
-	observer.ObserveInt64(t.readyBacklogFiles, snapshot.readyBacklogFiles)
-	observer.ObserveInt64(t.readyBacklogBytes, snapshot.readyBacklogBytes)
 	observer.ObserveInt64(t.streamState, int64(snapshot.state))
 }
 

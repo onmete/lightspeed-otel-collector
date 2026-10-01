@@ -97,8 +97,6 @@ type agenticTraceFixture struct {
 }
 
 func TestAgenticExporterRuntime(t *testing.T) {
-	podBefore := collectorPodName(t)
-
 	happy := newAgenticTraceFixture("happy")
 	happyLogWindowStart := time.Now().Add(-time.Minute)
 	happyDebugEntriesBefore := debugTraceEntryCount(collectorLogsSince(t, happyLogWindowStart))
@@ -109,13 +107,17 @@ func TestAgenticExporterRuntime(t *testing.T) {
 	waitForDebugTrace(t, happyLogWindowStart, happyDebugEntriesBefore, 10*time.Second)
 	assertCollectorHealthy(t)
 
-	setCollectorTraceDirectoryMode(t, "0550")
-	traceDirectoryWritable := false
+	assertCollectorNonRoot(t)
+	assertCollectorSpoolTopology(t)
+	collectorUIDBeforeFailure, restartCountBeforeFailure := collectorProcessState(t)
+
+	traceVersionDirectoryWritable := false
 	defer func() {
-		if !traceDirectoryWritable {
-			setCollectorTraceDirectoryMode(t, "0770")
+		if !traceVersionDirectoryWritable {
+			setCollectorTraceVersionDirectoryMode(t, "2770")
 		}
 	}()
+	setCollectorTraceVersionDirectoryMode(t, "0550")
 
 	failure := newAgenticTraceFixture("failure")
 	failureLogWindowStart := time.Now().Add(-time.Minute)
@@ -124,15 +126,24 @@ func TestAgenticExporterRuntime(t *testing.T) {
 
 	waitForDebugTrace(t, failureLogWindowStart, failureDebugEntriesBefore, 10*time.Second)
 	assertCollectorHealthy(t)
+	sourceName := waitForAgenticSealedSource(t, failure, 45*time.Second)
 	assertAgenticMarkerAbsent(t, failure.marker)
 	assertContentFreeCollectorLogs(t, failureLogWindowStart, failure)
 
-	setCollectorTraceDirectoryMode(t, "0770")
-	traceDirectoryWritable = true
-	recoveredDocuments := waitForAgenticDocuments(t, failure.marker, 1, 45*time.Second)
+	setCollectorTraceVersionDirectoryMode(t, "2770")
+	traceVersionDirectoryWritable = true
+	waitForAgenticDocuments(t, failure.marker, 1, 45*time.Second)
+	waitForAgenticSealedSourceRemoval(t, sourceName, 10*time.Second)
+	recoveredDocuments := agenticDocumentsForMarker(t, failure.marker)
 	assertHappyAgenticDocument(t, failure, recoveredDocuments)
-	if podAfter := collectorPodName(t); podAfter != podBefore {
-		t.Fatalf("collector restarted during spool recovery: before=%s after=%s", podBefore, podAfter)
+	collectorUIDAfterRecovery, restartCountAfterRecovery := collectorProcessState(t)
+	if collectorUIDAfterRecovery != collectorUIDBeforeFailure {
+		t.Fatalf("collector pod UID changed during spool recovery: before=%s after=%s",
+			collectorUIDBeforeFailure, collectorUIDAfterRecovery)
+	}
+	if restartCountAfterRecovery != restartCountBeforeFailure {
+		t.Fatalf("collector container restarted during spool recovery: restartCount before=%d after=%d",
+			restartCountBeforeFailure, restartCountAfterRecovery)
 	}
 	assertCollectorHealthy(t)
 }
@@ -266,25 +277,74 @@ func waitForAgenticDocuments(
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		var matching []agenticJSONDocument
-		for _, name := range listCollectorJSONL(t) {
-			for _, line := range readCollectorJSONLLines(t, name) {
-				var document agenticJSONDocument
-				if err := json.Unmarshal([]byte(line), &document); err != nil {
-					t.Fatalf("decode native OTLP JSONL document in %q: %v", name, err)
-				}
-				if recordMarker(document) == marker {
-					matching = append(matching, document)
-				}
-			}
-		}
+		matching := agenticDocumentsForMarker(t, marker)
 		if len(matching) >= want {
 			return matching
 		}
 		time.Sleep(250 * time.Millisecond)
 	}
-	t.Fatalf("timed out waiting for %d matching native OTLP JSONL documents", want)
+	t.Fatalf("timed out waiting for %d matching native OTLP JSON array documents", want)
 	return nil
+}
+
+func agenticDocumentsForMarker(t *testing.T, marker string) []agenticJSONDocument {
+	t.Helper()
+	var matching []agenticJSONDocument
+	for _, name := range listCollectorJSONArrays(t) {
+		var documents []agenticJSONDocument
+		if err := json.Unmarshal([]byte(readCollectorJSONArray(t, name)), &documents); err != nil {
+			t.Fatalf("decode published native OTLP JSON array in %q: %v", name, err)
+		}
+		for _, document := range documents {
+			if recordMarker(document) == marker {
+				matching = append(matching, document)
+			}
+		}
+	}
+	return matching
+}
+
+func waitForAgenticSealedSource(
+	t *testing.T,
+	fixture agenticTraceFixture,
+	timeout time.Duration,
+) string {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		for _, name := range listCollectorSealedJSONLSources(t) {
+			source := readCollectorSealedJSONLSource(t, name)
+			if !strings.Contains(source, fixture.marker) {
+				continue
+			}
+			if !strings.HasSuffix(source, "\n") || !strings.Contains(source, fixture.payload) {
+				t.Fatalf("retained sealed source %q does not contain the complete failed record", name)
+			}
+			return name
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for the failed trace's sealed private source")
+	return ""
+}
+
+func waitForAgenticSealedSourceRemoval(t *testing.T, name string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		found := false
+		for _, source := range listCollectorSealedJSONLSources(t) {
+			if source == name {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	t.Fatalf("sealed private source %q remains after successful publication", name)
 }
 
 func recordMarker(document agenticJSONDocument) string {
@@ -414,12 +474,8 @@ func assertCollectorHealthy(t *testing.T) {
 
 func assertAgenticMarkerAbsent(t *testing.T, marker string) {
 	t.Helper()
-	for _, name := range listCollectorJSONL(t) {
-		for _, line := range readCollectorJSONLLines(t, name) {
-			if strings.Contains(line, marker) {
-				t.Fatalf("traces directory published marker %q while it was read-only", marker)
-			}
-		}
+	if documents := agenticDocumentsForMarker(t, marker); len(documents) != 0 {
+		t.Fatalf("versioned traces published marker %q while the v1 directory was read-only", marker)
 	}
 }
 

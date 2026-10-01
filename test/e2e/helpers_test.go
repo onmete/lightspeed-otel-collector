@@ -3,14 +3,13 @@
 package e2e
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"fmt"
-	"io"
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -155,12 +154,40 @@ func runKubectl(args ...string) (string, error) {
 	return strings.TrimSpace(stdout.String()), nil
 }
 
-const agenticTraceDirectory = "/var/lib/lightspeed-data-collection/traces"
+const (
+	agenticSpoolDirectory        = "/var/lib/lightspeed-data"
+	agenticExportPickupRoot      = agenticSpoolDirectory + "/export"
+	agenticTraceDirectory        = agenticExportPickupRoot + "/traces"
+	agenticTraceVersionDirectory = agenticTraceDirectory + "/v1"
+	agenticStagingDirectory      = agenticSpoolDirectory + "/staging"
+)
 
 func collectorPodName(t *testing.T) string {
 	t.Helper()
 	return kubectl(t, "get", "pod", "-n", env.Namespace, "-l", "app=otel-collector",
 		"-o", "jsonpath={.items[0].metadata.name}")
+}
+
+func collectorProcessState(t *testing.T) (string, int32) {
+	t.Helper()
+	podName := collectorPodName(t)
+	pod, err := newK8sClientset().CoreV1().Pods(env.Namespace).Get(context.Background(), podName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get collector pod %q: %v", podName, err)
+	}
+	for _, status := range pod.Status.ContainerStatuses {
+		if status.Name == "collector" {
+			return string(pod.UID), status.RestartCount
+		}
+	}
+	t.Fatalf("collector container status missing in pod %q", podName)
+	return "", 0
+}
+
+func collectorLogsSince(t *testing.T, since time.Time) string {
+	t.Helper()
+	return kubectl(t, "logs", "-n", env.Namespace, collectorPodName(t), "-c", "collector",
+		"--since-time="+since.UTC().Format(time.RFC3339Nano))
 }
 
 func collectorExec(t *testing.T, args ...string) string {
@@ -170,70 +197,128 @@ func collectorExec(t *testing.T, args ...string) string {
 	return kubectl(t, append(kubectlArgs, args...)...)
 }
 
-func listCollectorJSONL(t *testing.T) []string {
+func assertCollectorNonRoot(t *testing.T) {
+	t.Helper()
+	if uid := collectorExec(t, "id", "-u"); uid == "0" {
+		t.Fatal("collector must run as non-root for filesystem failure injection")
+	}
+}
+
+func assertCollectorSpoolTopology(t *testing.T) {
+	t.Helper()
+	for _, directory := range []struct {
+		name string
+		path string
+	}{
+		{name: "staging", path: agenticStagingDirectory},
+		{name: "export pickup", path: agenticExportPickupRoot},
+		{name: "trace export", path: agenticTraceDirectory},
+		{name: "ready traces", path: agenticTraceVersionDirectory},
+	} {
+		if !pathIsStrictlyWithin(agenticSpoolDirectory, directory.path) {
+			t.Fatalf("%s path %q is not beneath spool mount %q",
+				directory.name, directory.path, agenticSpoolDirectory)
+		}
+	}
+	if pathIsWithinOrSame(agenticExportPickupRoot, agenticStagingDirectory) {
+		t.Fatalf("private staging directory %q is inside export pickup root %q",
+			agenticStagingDirectory, agenticExportPickupRoot)
+	}
+
+	mountInfo := collectorExec(t, "cat", "/proc/self/mountinfo")
+	for _, directory := range []string{
+		agenticSpoolDirectory,
+		agenticStagingDirectory,
+		agenticExportPickupRoot,
+		agenticTraceDirectory,
+		agenticTraceVersionDirectory,
+	} {
+		if mountPoint := collectorMountPointForPath(mountInfo, directory); mountPoint != agenticSpoolDirectory {
+			t.Fatalf("collector path %q uses mount %q, want shared spool mount %q",
+				directory, mountPoint, agenticSpoolDirectory)
+		}
+	}
+}
+
+func pathIsStrictlyWithin(root, path string) bool {
+	relative, err := filepath.Rel(root, path)
+	return err == nil && relative != "." && filepath.IsLocal(relative)
+}
+
+func pathIsWithinOrSame(root, path string) bool {
+	relative, err := filepath.Rel(root, path)
+	return err == nil && filepath.IsLocal(relative)
+}
+
+func collectorMountPointForPath(mountInfo, path string) string {
+	path = filepath.Clean(path)
+	mountPoint := ""
+	for _, line := range strings.Split(mountInfo, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 6 {
+			continue
+		}
+		candidate := filepath.Clean(fields[4])
+		if pathIsWithinOrSame(candidate, path) && len(candidate) > len(mountPoint) {
+			mountPoint = candidate
+		}
+	}
+	return mountPoint
+}
+
+func listCollectorJSONArrays(t *testing.T) []string {
 	t.Helper()
 	out := collectorExec(t, "sh", "-c",
-		`for file in "$1"/*.jsonl; do [ -f "$file" ] && printf '%s\n' "${file##*/}"; done; exit 0`,
-		"list-jsonl", agenticTraceDirectory)
+		`for file in "$1"/*.json; do [ -f "$file" ] && printf '%s\n' "${file##*/}"; done; exit 0`,
+		"list-arrays", agenticTraceVersionDirectory)
 	if out == "" {
 		return nil
 	}
 	return strings.Split(out, "\n")
 }
 
-func readCollectorJSONL(t *testing.T, name string) string {
+func readCollectorJSONArray(t *testing.T, name string) string {
 	t.Helper()
-	if !strings.HasSuffix(name, ".jsonl") || strings.Contains(name, "/") {
-		t.Fatalf("invalid JSONL filename %q", name)
+	if !strings.HasSuffix(name, ".json") || strings.Contains(name, "/") {
+		t.Fatalf("invalid JSON array filename %q", name)
 	}
 	output := collectorExec(t, "sh", "-c",
 		`printf '\001'; cat "$1"; printf '\002'`,
-		"read-jsonl", agenticTraceDirectory+"/"+name)
+		"read-array", agenticTraceVersionDirectory+"/"+name)
 	if !strings.HasPrefix(output, "\x01") || !strings.HasSuffix(output, "\x02") {
-		t.Fatalf("could not preserve complete JSONL bytes for %q", name)
+		t.Fatalf("could not preserve complete JSON array bytes for %q", name)
 	}
 	return strings.TrimSuffix(strings.TrimPrefix(output, "\x01"), "\x02")
 }
 
-func setCollectorTraceDirectoryMode(t *testing.T, mode string) {
+func listCollectorSealedJSONLSources(t *testing.T) []string {
 	t.Helper()
-	collectorExec(t, "chmod", mode, agenticTraceDirectory)
-}
-
-func collectorLogsSince(t *testing.T, since time.Time) string {
-	t.Helper()
-	return kubectl(t, "logs", "-n", env.Namespace, collectorPodName(t),
-		"--since-time="+since.UTC().Format(time.RFC3339Nano))
-}
-
-func readCollectorJSONLLines(t *testing.T, name string) []string {
-	t.Helper()
-	reader := bufio.NewReader(strings.NewReader(readCollectorJSONL(t, name)))
-	var lines []string
-	for {
-		line, err := reader.ReadBytes('\n')
-		switch {
-		case err == nil:
-			record := line[:len(line)-1]
-			if len(record) == 0 {
-				t.Fatalf("empty JSONL line in %q", name)
-			}
-			if bytes.ContainsAny(record, "\r\n") {
-				t.Fatalf("non-compact JSONL line in %q", name)
-			}
-			lines = append(lines, string(record))
-		case err == io.EOF:
-			if len(line) != 0 {
-				t.Fatalf("incomplete final JSONL line in %q", name)
-			}
-			if len(lines) == 0 {
-				t.Fatalf("empty JSONL file %q", name)
-			}
-			return lines
-		default:
-			t.Fatalf("read JSONL file %q: %v", name, err)
-		}
+	out := collectorExec(t, "sh", "-c",
+		`for file in "$1"/*.jsonl; do [ -f "$file" ] && printf '%s\n' "${file##*/}"; done; exit 0`,
+		"list-sealed-sources", agenticStagingDirectory)
+	if out == "" {
+		return nil
 	}
+	return strings.Split(out, "\n")
+}
+
+func readCollectorSealedJSONLSource(t *testing.T, name string) string {
+	t.Helper()
+	if !strings.HasSuffix(name, ".jsonl") || strings.Contains(name, "/") {
+		t.Fatalf("invalid sealed JSONL source filename %q", name)
+	}
+	output := collectorExec(t, "sh", "-c",
+		`printf '\001'; cat "$1"; printf '\002'`,
+		"read-sealed-source", agenticStagingDirectory+"/"+name)
+	if !strings.HasPrefix(output, "\x01") || !strings.HasSuffix(output, "\x02") {
+		t.Fatalf("could not preserve complete sealed JSONL source %q", name)
+	}
+	return strings.TrimSuffix(strings.TrimPrefix(output, "\x01"), "\x02")
+}
+
+func setCollectorTraceVersionDirectoryMode(t *testing.T, mode string) {
+	t.Helper()
+	collectorExec(t, "chmod", mode, agenticTraceVersionDirectory)
 }
 
 func mustKubectlApply(ns, manifest string) {
@@ -670,7 +755,8 @@ exporters:
   debug:
     verbosity: basic
   agentic:
-    directory: /var/lib/lightspeed-data-collection/traces
+    directory: /var/lib/lightspeed-data/export/traces
+    staging_directory: /var/lib/lightspeed-data/staging
     max_backlog_bytes: 8388608
 extensions:
   health_check:
@@ -739,6 +825,10 @@ spec:
       - name: collector
         image: {{.Image}}
         imagePullPolicy: Always
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 65532
+          runAsGroup: 65532
         args: ["--config=/etc/otelcol/config.yaml"]
         ports:
         - containerPort: 4317
@@ -762,7 +852,7 @@ spec:
         - name: file-storage
           mountPath: /var/lib/otelcol/file_storage
         - name: agentic-data
-          mountPath: /var/lib/lightspeed-data-collection
+          mountPath: /var/lib/lightspeed-data
         readinessProbe:
           httpGet:
             path: /

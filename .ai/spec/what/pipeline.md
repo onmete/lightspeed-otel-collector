@@ -29,11 +29,11 @@ The data pipeline: how telemetry flows from OLS components through the collector
 
 ### Agentic Product-Data Branch
 
-12. The trace pipeline MAY fan out original OTLP traces to the local `agentic` exporter. Each eligible span and all its attached events MUST remain one native contextualized OTLP JSON document in a single `traces/` JSONL spool; the branch MUST NOT classify Action/Transcript candidates or mutate/back-pressure other destinations. See `what/agentic-data-collection.md`. `[IMPLEMENTED: OLS-4248]` `[IMPLEMENTED: OLS-4249]` The parent contract and ADR 0043 still require coordination before rollout.
+12. The trace pipeline MAY fan out original OTLP traces to the local `agentic` exporter. Each eligible span and all its attached events MUST remain one native contextualized OTLP JSON array element; the exporter privately stages LF-delimited JSONL and atomically publishes top-level arrays under `directory/v1/`. The branch MUST NOT classify Action/Transcript candidates or mutate/back-pressure other destinations. See `what/agentic-data-collection.md`. `[IMPLEMENTED: OLS-4248]` `[IMPLEMENTED: OLS-4249]` The Collector-local proof does not establish cluster or downstream-ingestion behavior.
 
 ## Collector-local Implementation Status
 
 | Ticket | Summary |
 |---|---|
 | OLS-4248 | Per-span Agentic eligibility, native OTLP serialization, document-level telemetry, and best-effort fan-out `[IMPLEMENTED: OLS-4248]` |
-| OLS-4249 | Single shared bounded Agentic JSONL spool, atomic publication, isolation, and recovery `[IMPLEMENTED: OLS-4249]` |
+| OLS-4249 | Private JSONL staging, versioned array publication, isolation, and recovery `[IMPLEMENTED: OLS-4249]` |

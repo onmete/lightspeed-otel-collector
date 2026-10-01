@@ -43,7 +43,8 @@ exporters:
       storage: file_storage
 
   agentic:
-    directory: /var/lib/lightspeed-data-collection/traces
+    directory: /var/lib/lightspeed-data/export/traces
+    staging_directory: /var/lib/lightspeed-data/staging
     max_backlog_bytes: 8388608
 
 extensions:
@@ -82,7 +83,7 @@ service:
       exporters: [postgres]
 
     # Accept traces so the OTLP receiver doesn't return UNIMPLEMENTED.
-    # Retain the nop sink while exporting agentic candidates as JSONL.
+    # Retain the nop sink while exporting agentic traces as versioned JSON arrays.
     traces:
       receivers: [otlp]
       exporters: [nop, agentic]

@@ -2,6 +2,7 @@ package agenticexporter
 
 import (
 	"context"
+	"path/filepath"
 	"sync"
 
 	"go.opentelemetry.io/collector/component"
@@ -52,13 +53,15 @@ func newAgenticExporter(settings exporter.Settings, cfg *Config) (*agenticExport
 		return nil, err
 	}
 
-	directory := ""
+	stagingDirectory := ""
+	readyDirectory := ""
 	maxBacklogBytes := int64(0)
 	if cfg != nil {
-		directory = cfg.Directory
+		stagingDirectory = filepath.Clean(cfg.StagingDirectory)
+		readyDirectory = filepath.Join(filepath.Clean(cfg.Directory), "v1")
 		maxBacklogBytes = cfg.MaxBacklogBytes
 	}
-	writer := newStreamWriter(directory, maxBacklogBytes)
+	writer := newStreamWriter(stagingDirectory, readyDirectory, maxBacklogBytes)
 	e := &agenticExporter{
 		enabled:        assessment.enabled,
 		disabledReason: assessment.reason,
@@ -373,10 +376,7 @@ func (e *agenticExporter) shutdown(ctx context.Context) error {
 			e.shutdownOnceRun(shutdownCtx)
 		}()
 	})
-	select {
-	case <-e.shutdownDone:
-	case <-ctx.Done():
-	}
+	<-e.shutdownDone
 	return nil
 }
 

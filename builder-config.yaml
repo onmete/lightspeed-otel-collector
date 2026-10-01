@@ -18,7 +18,7 @@ exporters:
   - gomod: github.com/openshift/lightspeed-otel-collector/postgresexporter v0.0.0
     path: ./postgresexporter
 
-  # Agentic exporter — writes contextualized native OTLP spans as JSONL.
+  # Agentic exporter — privately stages native OTLP spans as JSONL and publishes arrays.
   - gomod: github.com/openshift/lightspeed-otel-collector/agenticexporter v0.0.0
     path: ./agenticexporter
 

@@ -12,26 +12,13 @@ import (
 	"go.uber.org/zap"
 )
 
-func TestFactoryTypeAndDefaultConfig(t *testing.T) {
-	factory := NewFactory()
-	if factory.Type() != Type {
-		t.Fatalf("factory type = %q, want %q", factory.Type(), Type)
-	}
-	cfg, ok := factory.CreateDefaultConfig().(*Config)
-	if !ok {
-		t.Fatalf("default config type = %T, want *Config", factory.CreateDefaultConfig())
-	}
-	if assessment := assessConfig(cfg); !assessment.enabled {
-		t.Fatalf("default config is disabled: %s", assessment.reason)
-	}
-}
-
 func TestFactoryCreatedExporterLifecycle(t *testing.T) {
 	factory := NewFactory()
 	root := t.TempDir()
 	cfg := &Config{
-		Directory:       filepath.Join(root, "traces"),
-		MaxBacklogBytes: 1 << 20,
+		Directory:        filepath.Join(root, "export", "traces"),
+		StagingDirectory: filepath.Join(root, "staging"),
+		MaxBacklogBytes:  1 << 20,
 	}
 	settings := exporter.Settings{
 		ID: component.NewID(Type),

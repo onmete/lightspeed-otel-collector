@@ -21,7 +21,7 @@ func TestTelemetryContract(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newTelemetry() error = %v", err)
 	}
-	writer := newStreamWriter(t.TempDir(), 1024)
+	writer := newTestStreamWriter(t.TempDir(), 1024)
 	if err := tel.registerWriter(writer); err != nil {
 		t.Fatalf("registerWriter() error = %v", err)
 	}
@@ -51,8 +51,6 @@ func TestTelemetryContract(t *testing.T) {
 		"otelcol_agentic_exporter_ready_files_created":     false,
 		"otelcol_agentic_exporter_ready_records_created":   false,
 		"otelcol_agentic_exporter_ready_bytes_created":     false,
-		"otelcol_agentic_exporter_ready_backlog_files":     false,
-		"otelcol_agentic_exporter_ready_backlog_bytes":     false,
 		"otelcol_agentic_exporter_file_operation_failures": false,
 		"otelcol_agentic_exporter_stream_state":            false,
 	}
@@ -166,8 +164,6 @@ func assertMetricKind(t *testing.T, measured metricdata.Metrics) {
 		"otelcol_agentic_exporter_unpublished_bytes",
 		"otelcol_agentic_exporter_open_batch_records",
 		"otelcol_agentic_exporter_open_batch_bytes",
-		"otelcol_agentic_exporter_ready_backlog_files",
-		"otelcol_agentic_exporter_ready_backlog_bytes",
 		"otelcol_agentic_exporter_stream_state":
 		if _, ok := measured.Data.(metricdata.Gauge[int64]); !ok {
 			t.Errorf("%s data type = %T, want int64 gauge", measured.Name, measured.Data)

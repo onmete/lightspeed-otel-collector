@@ -1,11 +1,10 @@
 package agenticexporter
 
 import (
-	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
-	"io"
 	"math"
 	"os"
 	"path/filepath"
@@ -844,13 +843,15 @@ func TestEncodingCancellationAccountsForCanceledAndDiscardedDocuments(t *testing
 func TestExporterLifecycleContainsFilesystemLossAndLogsNoContent(t *testing.T) {
 	core, observed := observer.New(zap.WarnLevel)
 	logger := zap.New(core)
-	blockingFile := filepath.Join(t.TempDir(), "not-a-directory")
+	root := t.TempDir()
+	blockingFile := filepath.Join(root, "not-a-directory")
 	if err := os.WriteFile(blockingFile, []byte("unique-filesystem-secret"), 0o600); err != nil {
 		t.Fatalf("WriteFile() error = %v", err)
 	}
 	cfg := &Config{
-		Directory:       filepath.Join(blockingFile, "traces"),
-		MaxBacklogBytes: 1 << 20,
+		Directory:        filepath.Join(blockingFile, "traces"),
+		StagingDirectory: filepath.Join(root, "staging"),
+		MaxBacklogBytes:  1 << 20,
 	}
 	exp := newTestAgenticExporter(t, cfg, logger, noop.NewMeterProvider())
 	if err := exp.start(context.Background(), nil); err != nil {
@@ -884,6 +885,148 @@ func TestExporterLifecycleContainsFilesystemLossAndLogsNoContent(t *testing.T) {
 				t.Errorf("log field %q is not bounded", field.Key)
 			}
 		}
+	}
+}
+
+func TestExporterShutdownWaitsForFinalRenameAfterContextDeadline(t *testing.T) {
+	cfg := validTestConfig(t)
+	exp := newTestAgenticExporter(t, cfg, zap.NewNop(), noop.NewMeterProvider())
+
+	finalRenameStarted := make(chan struct{}, 1)
+	finalRenameRelease := make(chan struct{})
+	released := false
+	releaseFinalRename := func() {
+		if !released {
+			close(finalRenameRelease)
+			released = true
+		}
+	}
+	defer releaseFinalRename()
+
+	ops := &faultFileOps{
+		base:                      osFileOps{},
+		failures:                  map[fileOperation]int{},
+		blockedFinalRenameStarted: finalRenameStarted,
+		blockedFinalRenameRelease: finalRenameRelease,
+	}
+	exp.writer.ops = ops
+	exp.writer.maxBatchAge = time.Hour
+
+	hookReturned := make(chan struct{})
+	callbacksAfterReturn := make(chan string, 8)
+	noteCallback := func(name string) {
+		select {
+		case <-hookReturned:
+			select {
+			case callbacksAfterReturn <- name:
+			default:
+			}
+		default:
+		}
+	}
+	publishedRecords := make(chan int64, 1)
+	priorCallbacks := exp.writer.callbacks
+	exp.writer.callbacks = streamCallbacks{
+		stateChanged: func(from, to streamState, operation fileOperation) {
+			noteCallback("stateChanged")
+			if priorCallbacks.stateChanged != nil {
+				priorCallbacks.stateChanged(from, to, operation)
+			}
+		},
+		operationFailed: func(operation fileOperation) {
+			noteCallback("operationFailed")
+			if priorCallbacks.operationFailed != nil {
+				priorCallbacks.operationFailed(operation)
+			}
+		},
+		published: func(records, bytes int64) {
+			noteCallback("published")
+			select {
+			case publishedRecords <- records:
+			default:
+			}
+			if priorCallbacks.published != nil {
+				priorCallbacks.published(records, bytes)
+			}
+		},
+		shutdownDeadline: func(records, bytes int64) {
+			noteCallback("shutdownDeadline")
+			if priorCallbacks.shutdownDeadline != nil {
+				priorCallbacks.shutdownDeadline(records, bytes)
+			}
+		},
+	}
+
+	if err := exp.start(context.Background(), nil); err != nil {
+		t.Fatalf("start() error = %v", err)
+	}
+	if err := exp.consumeTraces(context.Background(), eligibleTestTraces("final-rename-shutdown")); err != nil {
+		t.Fatalf("consumeTraces() error = %v", err)
+	}
+	waitUntil(t, exp.encodingIdle)
+	if got := exp.writer.snapshot().unpublishedRecords; got != 1 {
+		t.Fatalf("queued records before shutdown = %d, want one", got)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	shutdownResult := make(chan error, 1)
+	go func() {
+		err := exp.shutdown(ctx)
+		close(hookReturned)
+		shutdownResult <- err
+	}()
+	waitSignal(t, finalRenameStarted)
+	if sources := ops.finalRenameSources(); len(sources) != 1 || filepath.Ext(sources[0]) != ".tmp" {
+		t.Fatalf("blocked final rename sources = %v, want one staging array temp", sources)
+	}
+
+	cancel()
+	waitUntil(t, func() bool { return exp.writer.workCtx.Err() != nil })
+	select {
+	case err := <-shutdownResult:
+		t.Fatalf("shutdown() returned before final rename completed: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	releaseFinalRename()
+	select {
+	case err := <-shutdownResult:
+		if err != nil {
+			t.Fatalf("shutdown() error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("shutdown() did not return after final rename completed")
+	}
+	select {
+	case <-exp.shutdownDone:
+	default:
+		t.Fatal("shutdown() returned before exporter teardown completed")
+	}
+	select {
+	case callback := <-callbacksAfterReturn:
+		t.Fatalf("%s callback occurred after shutdown() returned", callback)
+	default:
+	}
+	select {
+	case records := <-publishedRecords:
+		if records != 1 {
+			t.Fatalf("published records = %d, want one", records)
+		}
+	default:
+		t.Fatal("native publication callback did not complete before shutdown() returned")
+	}
+
+	if sources := ops.finalRenameSources(); len(sources) != 1 {
+		t.Fatalf("final rename calls = %v, want one completed staging-array publication", sources)
+	}
+	documents := readNativeReady(t, cfg.Directory)
+	if len(documents) != 1 {
+		t.Fatalf("published native documents = %d, want one", len(documents))
+	}
+	span := documents[0].ResourceSpans().At(0).ScopeSpans().At(0).Spans().At(0)
+	if span.Name() != "final-rename-shutdown" {
+		t.Fatalf("published span name = %q, want original converted span", span.Name())
 	}
 }
 
@@ -948,46 +1091,32 @@ func publishTestTraces(t *testing.T, cfg *Config, exp *agenticExporter, traces p
 func readNativeReady(t *testing.T, directory string) []ptrace.Traces {
 	t.Helper()
 	var result []ptrace.Traces
-	for _, name := range readyFiles(t, directory) {
+	readyDirectory := filepath.Join(directory, "v1")
+	for _, name := range readyFiles(t, readyDirectory) {
 		if !canonicalReadyName.MatchString(name) {
 			t.Fatalf("unexpected ready filename %q", name)
 		}
-		file, err := os.Open(filepath.Join(directory, name))
+		raw, err := os.ReadFile(filepath.Join(readyDirectory, name))
 		if err != nil {
 			t.Fatal(err)
 		}
-		reader := bufio.NewReader(file)
-		for {
-			line, err := reader.ReadBytes('\n')
-			if err == io.EOF {
-				if len(line) != 0 {
-					_ = file.Close()
-					t.Fatal("incomplete final JSONL line")
-				}
-				break
-			}
-			if err != nil {
-				_ = file.Close()
-				t.Fatal(err)
-			}
-			if bytes.ContainsAny(line[:len(line)-1], "\n\r") {
-				_ = file.Close()
-				t.Fatal("noncompact record")
-			}
+		var documents []json.RawMessage
+		if err := json.Unmarshal(raw, &documents); err != nil {
+			t.Fatalf("decode ready array: %v", err)
+		}
+		if documents == nil {
+			t.Fatal("ready file is not a JSON array")
+		}
+		for _, document := range documents {
 			decoder := ptrace.JSONUnmarshaler{}
-			traces, err := decoder.UnmarshalTraces(line)
+			traces, err := decoder.UnmarshalTraces(document)
 			if err != nil {
-				_ = file.Close()
 				t.Fatal(err)
 			}
 			if traces.SpanCount() != 1 {
-				_ = file.Close()
-				t.Fatal("line is not one native span document")
+				t.Fatal("array element is not one native span document")
 			}
 			result = append(result, traces)
-		}
-		if err := file.Close(); err != nil {
-			t.Fatal(err)
 		}
 	}
 	return result
@@ -1016,9 +1145,11 @@ func newTestAgenticExporter(
 
 func validTestConfig(t *testing.T) *Config {
 	t.Helper()
+	root := t.TempDir()
 	return &Config{
-		Directory:       filepath.Join(t.TempDir(), "traces"),
-		MaxBacklogBytes: 1 << 20,
+		Directory:        filepath.Join(root, "export", "traces"),
+		StagingDirectory: filepath.Join(root, "staging"),
+		MaxBacklogBytes:  1 << 20,
 	}
 }
 

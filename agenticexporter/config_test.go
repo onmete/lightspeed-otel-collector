@@ -11,8 +11,18 @@ func TestAssessConfig(t *testing.T) {
 		{
 			name: "valid explicit config",
 			cfg: &Config{
-				Directory:       "/srv/agentic/traces",
-				MaxBacklogBytes: 8192,
+				Directory:        "/srv/agentic/traces",
+				StagingDirectory: "/srv/agentic/staging",
+				MaxBacklogBytes:  8192,
+			},
+			want: configAssessment{enabled: true, reason: configOK},
+		},
+		{
+			name: "valid sibling path with common prefix",
+			cfg: &Config{
+				Directory:        "/srv/agentic/traces",
+				StagingDirectory: "/srv/agentic/traces-staging",
+				MaxBacklogBytes:  8192,
 			},
 			want: configAssessment{enabled: true, reason: configOK},
 		},
@@ -20,30 +30,87 @@ func TestAssessConfig(t *testing.T) {
 		{
 			name: "empty directory",
 			cfg: &Config{
-				MaxBacklogBytes: 1,
+				StagingDirectory: "/tmp/staging",
+				MaxBacklogBytes:  1,
 			},
 			want: configAssessment{reason: configInvalidDirectory},
 		},
 		{
 			name: "relative directory",
 			cfg: &Config{
-				Directory:       "traces",
+				Directory:        "traces",
+				StagingDirectory: "/tmp/staging",
+				MaxBacklogBytes:  1,
+			},
+			want: configAssessment{reason: configInvalidDirectory},
+		},
+		{
+			name: "empty staging directory",
+			cfg: &Config{
+				Directory:       "/tmp/traces",
 				MaxBacklogBytes: 1,
+			},
+			want: configAssessment{reason: configInvalidDirectory},
+		},
+		{
+			name: "relative staging directory",
+			cfg: &Config{
+				Directory:        "/tmp/traces",
+				StagingDirectory: "staging",
+				MaxBacklogBytes:  1,
+			},
+			want: configAssessment{reason: configInvalidDirectory},
+		},
+		{
+			name: "same cleaned directory",
+			cfg: &Config{
+				Directory:        "/tmp/export",
+				StagingDirectory: "/tmp/export/./",
+				MaxBacklogBytes:  1,
+			},
+			want: configAssessment{reason: configInvalidDirectory},
+		},
+		{
+			name: "staging nested under export directory",
+			cfg: &Config{
+				Directory:        "/tmp/export",
+				StagingDirectory: "/tmp/export/staging",
+				MaxBacklogBytes:  1,
+			},
+			want: configAssessment{reason: configInvalidDirectory},
+		},
+		{
+			name: "export directory nested under staging",
+			cfg: &Config{
+				Directory:        "/tmp/export/traces",
+				StagingDirectory: "/tmp/export",
+				MaxBacklogBytes:  1,
+			},
+			want: configAssessment{reason: configInvalidDirectory},
+		},
+		{
+			name: "cleaned paths overlap",
+			cfg: &Config{
+				Directory:        "/tmp/root/../traces",
+				StagingDirectory: "/tmp/traces",
+				MaxBacklogBytes:  1,
 			},
 			want: configAssessment{reason: configInvalidDirectory},
 		},
 		{
 			name: "zero backlog",
 			cfg: &Config{
-				Directory: "/tmp/traces",
+				Directory:        "/tmp/traces",
+				StagingDirectory: "/tmp/staging",
 			},
 			want: configAssessment{reason: configInvalidBacklog},
 		},
 		{
 			name: "negative backlog",
 			cfg: &Config{
-				Directory:       "/tmp/traces",
-				MaxBacklogBytes: -1,
+				Directory:        "/tmp/traces",
+				StagingDirectory: "/tmp/staging",
+				MaxBacklogBytes:  -1,
 			},
 			want: configAssessment{reason: configInvalidBacklog},
 		},
@@ -61,8 +128,10 @@ func TestAssessConfig(t *testing.T) {
 func TestValidateIsNonFatal(t *testing.T) {
 	invalid := []*Config{
 		{},
-		{Directory: "relative", MaxBacklogBytes: 1},
-		{Directory: "/tmp/traces", MaxBacklogBytes: 0},
+		{Directory: "relative", StagingDirectory: "/tmp/staging", MaxBacklogBytes: 1},
+		{Directory: "/tmp/traces", StagingDirectory: "relative", MaxBacklogBytes: 1},
+		{Directory: "/tmp/traces", StagingDirectory: "/tmp/traces/staging", MaxBacklogBytes: 1},
+		{Directory: "/tmp/traces", StagingDirectory: "/tmp/staging", MaxBacklogBytes: 0},
 	}
 
 	for i, cfg := range invalid {

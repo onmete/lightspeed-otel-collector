@@ -51,9 +51,10 @@ exporters:
     tls:
       insecure: false
 
-  # Agentic traces → one native OTLP JSONL document per span.
+  # Agentic traces → versioned JSON arrays of native OTLP span documents.
   agentic:
-    directory: /var/lib/lightspeed-data-collection/traces
+    directory: /var/lib/lightspeed-data/export/traces
+    staging_directory: /var/lib/lightspeed-data/staging
     max_backlog_bytes: 8388608
 
   # Debug — prints to stdout (remove in production).
