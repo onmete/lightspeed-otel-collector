@@ -43,9 +43,8 @@ exporters:
       storage: file_storage
 
   agentic:
-    actions_directory: /var/lib/lightspeed-data-collection/actions
-    transcripts_directory: /var/lib/lightspeed-data-collection/transcripts
-    max_backlog_bytes: 4194304
+    directory: /var/lib/lightspeed-data-collection/traces
+    max_backlog_bytes: 8388608
 
 extensions:
   health_check:

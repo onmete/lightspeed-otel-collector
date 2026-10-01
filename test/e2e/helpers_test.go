@@ -3,9 +3,11 @@
 package e2e
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"os/exec"
@@ -153,7 +155,7 @@ func runKubectl(args ...string) (string, error) {
 	return strings.TrimSpace(stdout.String()), nil
 }
 
-const agenticDataRoot = "/var/lib/lightspeed-data-collection"
+const agenticTraceDirectory = "/var/lib/lightspeed-data-collection/traces"
 
 func collectorPodName(t *testing.T) string {
 	t.Helper()
@@ -168,40 +170,34 @@ func collectorExec(t *testing.T, args ...string) string {
 	return kubectl(t, append(kubectlArgs, args...)...)
 }
 
-func agenticStreamDirectory(t *testing.T, stream string) string {
+func listCollectorJSONL(t *testing.T) []string {
 	t.Helper()
-	switch stream {
-	case "actions", "transcripts":
-		return agenticDataRoot + "/" + stream
-	default:
-		t.Fatalf("unknown agentic stream %q", stream)
-		return ""
-	}
-}
-
-func listCollectorJSONL(t *testing.T, stream string) []string {
-	t.Helper()
-	dir := agenticStreamDirectory(t, stream)
 	out := collectorExec(t, "sh", "-c",
 		`for file in "$1"/*.jsonl; do [ -f "$file" ] && printf '%s\n' "${file##*/}"; done; exit 0`,
-		"list-jsonl", dir)
+		"list-jsonl", agenticTraceDirectory)
 	if out == "" {
 		return nil
 	}
 	return strings.Split(out, "\n")
 }
 
-func readCollectorJSONL(t *testing.T, stream, name string) string {
+func readCollectorJSONL(t *testing.T, name string) string {
 	t.Helper()
 	if !strings.HasSuffix(name, ".jsonl") || strings.Contains(name, "/") {
 		t.Fatalf("invalid JSONL filename %q", name)
 	}
-	return collectorExec(t, "cat", agenticStreamDirectory(t, stream)+"/"+name)
+	output := collectorExec(t, "sh", "-c",
+		`printf '\001'; cat "$1"; printf '\002'`,
+		"read-jsonl", agenticTraceDirectory+"/"+name)
+	if !strings.HasPrefix(output, "\x01") || !strings.HasSuffix(output, "\x02") {
+		t.Fatalf("could not preserve complete JSONL bytes for %q", name)
+	}
+	return strings.TrimSuffix(strings.TrimPrefix(output, "\x01"), "\x02")
 }
 
-func setCollectorStreamDirectoryMode(t *testing.T, stream, mode string) {
+func setCollectorTraceDirectoryMode(t *testing.T, mode string) {
 	t.Helper()
-	collectorExec(t, "chmod", mode, agenticStreamDirectory(t, stream))
+	collectorExec(t, "chmod", mode, agenticTraceDirectory)
 }
 
 func collectorLogsSince(t *testing.T, since time.Time) string {
@@ -210,31 +206,34 @@ func collectorLogsSince(t *testing.T, since time.Time) string {
 		"--since-time="+since.UTC().Format(time.RFC3339Nano))
 }
 
-func waitForJSONLOutput(
-	t *testing.T,
-	stream string,
-	matches func(string) bool,
-	want int,
-	timeout time.Duration,
-) []string {
+func readCollectorJSONLLines(t *testing.T, name string) []string {
 	t.Helper()
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		var matching []string
-		for _, name := range listCollectorJSONL(t, stream) {
-			for _, line := range strings.Split(readCollectorJSONL(t, stream, name), "\n") {
-				if line != "" && matches(line) {
-					matching = append(matching, line)
-				}
+	reader := bufio.NewReader(strings.NewReader(readCollectorJSONL(t, name)))
+	var lines []string
+	for {
+		line, err := reader.ReadBytes('\n')
+		switch {
+		case err == nil:
+			record := line[:len(line)-1]
+			if len(record) == 0 {
+				t.Fatalf("empty JSONL line in %q", name)
 			}
+			if bytes.ContainsAny(record, "\r\n") {
+				t.Fatalf("non-compact JSONL line in %q", name)
+			}
+			lines = append(lines, string(record))
+		case err == io.EOF:
+			if len(line) != 0 {
+				t.Fatalf("incomplete final JSONL line in %q", name)
+			}
+			if len(lines) == 0 {
+				t.Fatalf("empty JSONL file %q", name)
+			}
+			return lines
+		default:
+			t.Fatalf("read JSONL file %q: %v", name, err)
 		}
-		if len(matching) >= want {
-			return matching
-		}
-		time.Sleep(250 * time.Millisecond)
 	}
-	t.Fatalf("timed out waiting for %d matching %s JSONL records", want, stream)
-	return nil
 }
 
 func mustKubectlApply(ns, manifest string) {
@@ -671,9 +670,8 @@ exporters:
   debug:
     verbosity: basic
   agentic:
-    actions_directory: /var/lib/lightspeed-data-collection/actions
-    transcripts_directory: /var/lib/lightspeed-data-collection/transcripts
-    max_backlog_bytes: 4194304
+    directory: /var/lib/lightspeed-data-collection/traces
+    max_backlog_bytes: 8388608
 extensions:
   health_check:
     endpoint: 0.0.0.0:13133

@@ -55,21 +55,21 @@ func newTelemetry(settings component.TelemetrySettings) (*telemetry, error) {
 
 	if t.candidates, err = meter.Int64Counter(
 		"otelcol_agentic_exporter_candidates",
-		metric.WithDescription("Candidate records successfully projected and admitted to a stream."),
+		metric.WithDescription("Native OTLP span documents successfully admitted to the shared spool."),
 		metric.WithUnit("{records}"),
 	); err != nil {
 		return nil, err
 	}
 	if t.rejections, err = meter.Int64Counter(
 		"otelcol_agentic_exporter_rejections",
-		metric.WithDescription("Candidate atoms rejected before admission."),
+		metric.WithDescription("Native OTLP span documents rejected before admission or lost at admission."),
 		metric.WithUnit("{records}"),
 	); err != nil {
 		return nil, err
 	}
 	if t.recordSize, err = meter.Int64Histogram(
 		"otelcol_agentic_exporter_record_size",
-		metric.WithDescription("Size of an admitted JSONL record, including its trailing line feed."),
+		metric.WithDescription("Size of an admitted native OTLP JSONL document, including its trailing line feed."),
 		metric.WithUnit("By"),
 	); err != nil {
 		return nil, err
@@ -83,7 +83,7 @@ func newTelemetry(settings component.TelemetrySettings) (*telemetry, error) {
 	}
 	if t.readyRecordsCreated, err = meter.Int64Counter(
 		"otelcol_agentic_exporter_ready_records_created",
-		metric.WithDescription("Records published in ready files."),
+		metric.WithDescription("Span documents published in ready files."),
 		metric.WithUnit("{records}"),
 	); err != nil {
 		return nil, err
@@ -112,7 +112,7 @@ func newTelemetry(settings component.TelemetrySettings) (*telemetry, error) {
 	}
 	if t.unpublishedRecords, err = meter.Int64ObservableGauge(
 		"otelcol_agentic_exporter_unpublished_records",
-		metric.WithDescription("Records admitted but not yet published."),
+		metric.WithDescription("Span documents admitted but not yet published."),
 		metric.WithUnit("{records}"),
 	); err != nil {
 		return nil, err
@@ -126,7 +126,7 @@ func newTelemetry(settings component.TelemetrySettings) (*telemetry, error) {
 	}
 	if t.openBatchRecords, err = meter.Int64ObservableGauge(
 		"otelcol_agentic_exporter_open_batch_records",
-		metric.WithDescription("Records in the open batch."),
+		metric.WithDescription("Span documents in the open batch."),
 		metric.WithUnit("{records}"),
 	); err != nil {
 		return nil, err
@@ -170,14 +170,13 @@ func newTelemetry(settings component.TelemetrySettings) (*telemetry, error) {
 	return t, nil
 }
 
-func (t *telemetry) registerWriters(actions, transcripts *streamWriter) error {
-	if actions == nil || transcripts == nil {
+func (t *telemetry) registerWriter(writer *streamWriter) error {
+	if writer == nil {
 		return errors.New("agentic exporter stream writer is nil")
 	}
 	registration, err := t.meter.RegisterCallback(
 		func(_ context.Context, observer metric.Observer) error {
-			t.observeSnapshot(observer, actions.candidate, actions.snapshot())
-			t.observeSnapshot(observer, transcripts.candidate, transcripts.snapshot())
+			t.observeSnapshot(observer, writer.snapshot())
 			return nil
 		},
 		t.queueHighWaterBytes,
@@ -197,64 +196,47 @@ func (t *telemetry) registerWriters(actions, transcripts *streamWriter) error {
 	return nil
 }
 
-func (t *telemetry) observeSnapshot(observer metric.Observer, candidate candidateType, snapshot streamSnapshot) {
-	attrs := metric.WithAttributes(attribute.String("candidate_type", string(candidate)))
-	observer.ObserveInt64(t.queueHighWaterBytes, snapshot.queueHighWaterBytes, attrs)
-	observer.ObserveInt64(t.unpublishedRecords, snapshot.unpublishedRecords, attrs)
-	observer.ObserveInt64(t.unpublishedBytes, snapshot.unpublishedBytes, attrs)
-	observer.ObserveInt64(t.openBatchRecords, snapshot.openBatchRecords, attrs)
-	observer.ObserveInt64(t.openBatchBytes, snapshot.openBatchBytes, attrs)
-	observer.ObserveFloat64(t.openBatchAge, snapshot.openBatchAge.Seconds(), attrs)
-	observer.ObserveInt64(t.readyBacklogFiles, snapshot.readyBacklogFiles, attrs)
-	observer.ObserveInt64(t.readyBacklogBytes, snapshot.readyBacklogBytes, attrs)
-	observer.ObserveInt64(t.streamState, int64(snapshot.state), attrs)
+func (t *telemetry) observeSnapshot(observer metric.Observer, snapshot streamSnapshot) {
+	observer.ObserveInt64(t.queueHighWaterBytes, snapshot.queueHighWaterBytes)
+	observer.ObserveInt64(t.unpublishedRecords, snapshot.unpublishedRecords)
+	observer.ObserveInt64(t.unpublishedBytes, snapshot.unpublishedBytes)
+	observer.ObserveInt64(t.openBatchRecords, snapshot.openBatchRecords)
+	observer.ObserveInt64(t.openBatchBytes, snapshot.openBatchBytes)
+	observer.ObserveFloat64(t.openBatchAge, snapshot.openBatchAge.Seconds())
+	observer.ObserveInt64(t.readyBacklogFiles, snapshot.readyBacklogFiles)
+	observer.ObserveInt64(t.readyBacklogBytes, snapshot.readyBacklogBytes)
+	observer.ObserveInt64(t.streamState, int64(snapshot.state))
 }
 
-func (t *telemetry) recordCandidate(
-	ctx context.Context,
-	candidate candidateType,
-	kind recordKind,
-	serviceName string,
-	size int,
-) {
+func (t *telemetry) recordAdmission(ctx context.Context, serviceName string, size int) {
 	ctx = metricContextWithoutSpan(ctx)
-	attrs := recordAttributes(candidate, kind, serviceName)
+	var attrs []attribute.KeyValue
+	if allowedServiceName(serviceName) {
+		attrs = append(attrs, attribute.String("service_name", serviceName))
+	}
 	t.candidates.Add(ctx, 1, metric.WithAttributes(attrs...))
 	t.recordSize.Record(ctx, int64(size), metric.WithAttributes(attrs...))
 }
-func (t *telemetry) recordRejection(
-	ctx context.Context,
-	candidate candidateType,
-	kind recordKind,
-	serviceName string,
-	reason rejectionReason,
-) {
+
+func (t *telemetry) recordRejection(ctx context.Context, serviceName string, reason rejectionReason) {
 	ctx = metricContextWithoutSpan(ctx)
-	attrs := []attribute.KeyValue{
-		attribute.String("candidate_type", string(candidate)),
-		attribute.String("record_kind", string(kind)),
-		attribute.String("reason", string(reason)),
-	}
+	attrs := []attribute.KeyValue{attribute.String("reason", string(reason))}
 	if allowedServiceName(serviceName) {
 		attrs = append(attrs, attribute.String("service_name", serviceName))
 	}
 	t.rejections.Add(ctx, 1, metric.WithAttributes(attrs...))
 }
 
-func (t *telemetry) recordPublished(ctx context.Context, candidate candidateType, records, bytes int64) {
+func (t *telemetry) recordPublished(ctx context.Context, records, bytes int64) {
 	ctx = metricContextWithoutSpan(ctx)
-	attrs := metric.WithAttributes(attribute.String("candidate_type", string(candidate)))
-	t.readyFilesCreated.Add(ctx, 1, attrs)
-	t.readyRecordsCreated.Add(ctx, records, attrs)
-	t.readyBytesCreated.Add(ctx, bytes, attrs)
+	t.readyFilesCreated.Add(ctx, 1)
+	t.readyRecordsCreated.Add(ctx, records)
+	t.readyBytesCreated.Add(ctx, bytes)
 }
 
-func (t *telemetry) recordFileOperationFailure(ctx context.Context, candidate candidateType, operation fileOperation) {
+func (t *telemetry) recordFileOperationFailure(ctx context.Context, operation fileOperation) {
 	ctx = metricContextWithoutSpan(ctx)
-	t.fileOperationFailures.Add(ctx, 1, metric.WithAttributes(
-		attribute.String("candidate_type", string(candidate)),
-		attribute.String("operation", string(operation)),
-	))
+	t.fileOperationFailures.Add(ctx, 1, metric.WithAttributes(attribute.String("operation", string(operation))))
 }
 
 func (t *telemetry) close() {
@@ -263,17 +245,6 @@ func (t *telemetry) close() {
 			_ = t.registration.Unregister()
 		}
 	})
-}
-
-func recordAttributes(candidate candidateType, kind recordKind, serviceName string) []attribute.KeyValue {
-	attrs := []attribute.KeyValue{
-		attribute.String("candidate_type", string(candidate)),
-		attribute.String("record_kind", string(kind)),
-	}
-	if allowedServiceName(serviceName) {
-		attrs = append(attrs, attribute.String("service_name", serviceName))
-	}
-	return attrs
 }
 
 func allowedServiceName(serviceName string) bool {

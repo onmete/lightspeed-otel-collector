@@ -13,7 +13,7 @@ import (
 	"time"
 )
 
-func TestStreamWriterPublishCleanupAndImmutableInput(t *testing.T) {
+func TestStreamWriterPublishesRecordAndKeepsReadyFilesImmutable(t *testing.T) {
 	dir := t.TempDir()
 	stale := ".00000000-0000-4000-8000-000000000000.tmp"
 	untouched := []string{
@@ -30,9 +30,9 @@ func TestStreamWriterPublishCleanupAndImmutableInput(t *testing.T) {
 	}
 
 	published := make(chan struct{}, 1)
-	w := newStreamWriter(candidateAction, dir, 64)
+	w := newStreamWriter(dir, 64)
 	w.maxFileBytes = 8
-	w.callbacks.published = func(candidateType, int64, int64) { published <- struct{}{} }
+	w.callbacks.published = func(int64, int64) { published <- struct{}{} }
 	if err := w.start(context.Background()); err != nil {
 		t.Fatalf("start: %v", err)
 	}
@@ -46,12 +46,8 @@ func TestStreamWriterPublishCleanupAndImmutableInput(t *testing.T) {
 	}
 
 	record := []byte("{\"a\":1}\n")
-	want := append([]byte(nil), record...)
 	if !w.tryEnqueue(record) {
 		t.Fatal("record rejected")
-	}
-	for i := range record {
-		record[i] = 'x'
 	}
 	waitSignal(t, published)
 
@@ -63,8 +59,8 @@ func TestStreamWriterPublishCleanupAndImmutableInput(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(got) != string(want) {
-		t.Fatalf("ready content = %q, want %q", got, want)
+	if string(got) != "{\"a\":1}\n" {
+		t.Fatalf("ready content = %q, want original record", got)
 	}
 	if !canonicalReadyName.MatchString(ready[0]) {
 		t.Fatalf("noncanonical ready name %q", ready[0])
@@ -73,7 +69,7 @@ func TestStreamWriterPublishCleanupAndImmutableInput(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	w.shutdown(ctx)
-	if got, _ := os.ReadFile(filepath.Join(dir, ready[0])); string(got) != string(want) {
+	if got, _ := os.ReadFile(filepath.Join(dir, ready[0])); string(got) != "{\"a\":1}\n" {
 		t.Fatalf("ready file changed after publication: %q", got)
 	}
 	if got, _ := os.ReadFile(filepath.Join(dir, "other.jsonl")); string(got) != "unrelated" {
@@ -83,9 +79,9 @@ func TestStreamWriterPublishCleanupAndImmutableInput(t *testing.T) {
 func TestStreamWriterSharedSpoolPermissions(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "stream")
 	published := make(chan struct{}, 1)
-	w := newStreamWriter(candidateAction, dir, 64)
+	w := newStreamWriter(dir, 64)
 	w.maxFileBytes = 1
-	w.callbacks.published = func(candidateType, int64, int64) { published <- struct{}{} }
+	w.callbacks.published = func(int64, int64) { published <- struct{}{} }
 	if err := w.start(context.Background()); err != nil {
 		t.Fatalf("start: %v", err)
 	}
@@ -143,7 +139,7 @@ func TestOSFileOpsMkdirAllPreservesExistingDirectory(t *testing.T) {
 }
 
 func TestStreamWriterAdmissionAndOversizedException(t *testing.T) {
-	w := newStreamWriter(candidateAction, t.TempDir(), 8)
+	w := newStreamWriter(t.TempDir(), 8)
 	if !w.tryEnqueue([]byte("1234567\n")) {
 		t.Fatal("exact budget fit rejected")
 	}
@@ -154,7 +150,7 @@ func TestStreamWriterAdmissionAndOversizedException(t *testing.T) {
 		t.Fatal("invalid record accepted")
 	}
 
-	oversized := newStreamWriter(candidateTranscript, t.TempDir(), 4)
+	oversized := newStreamWriter(t.TempDir(), 4)
 	if !oversized.tryEnqueue([]byte("oversized\n")) {
 		t.Fatal("single oversized record rejected on empty stream")
 	}
@@ -170,11 +166,11 @@ func TestStreamWriterTimerShutdownAndEmptySuppression(t *testing.T) {
 	dir := t.TempDir()
 	clock := newManualClock()
 	published := make(chan struct{}, 2)
-	w := newStreamWriter(candidateTranscript, dir, 64)
+	w := newStreamWriter(dir, 64)
 	w.clock = clock
 	w.maxFileBytes = 64
 	w.maxBatchAge = 30 * time.Second
-	w.callbacks.published = func(candidateType, int64, int64) { published <- struct{}{} }
+	w.callbacks.published = func(int64, int64) { published <- struct{}{} }
 	_ = w.start(context.Background())
 	if !w.tryEnqueue([]byte("one\n")) {
 		t.Fatal("enqueue rejected")
@@ -195,7 +191,7 @@ func TestStreamWriterTimerShutdownAndEmptySuppression(t *testing.T) {
 	}
 
 	emptyDir := t.TempDir()
-	empty := newStreamWriter(candidateAction, emptyDir, 64)
+	empty := newStreamWriter(emptyDir, 64)
 	_ = empty.start(context.Background())
 	empty.shutdown(context.Background())
 	if files := readyFiles(t, emptyDir); len(files) != 0 {
@@ -211,12 +207,12 @@ func TestStreamWriterFailureRecoveryMatrix(t *testing.T) {
 			ops := &faultFileOps{base: osFileOps{}, failures: map[fileOperation]int{operation: 1}}
 			transitions := make(chan stateEdge, 4)
 			published := make(chan struct{}, 1)
-			w := newStreamWriter(candidateAction, dir, 64)
+			w := newStreamWriter(dir, 64)
 			w.ops, w.clock, w.maxFileBytes = ops, clock, 4
-			w.callbacks.stateChanged = func(_ candidateType, from, to streamState, op fileOperation) {
+			w.callbacks.stateChanged = func(from, to streamState, op fileOperation) {
 				transitions <- stateEdge{from: from, to: to, operation: op}
 			}
-			w.callbacks.published = func(candidateType, int64, int64) { published <- struct{}{} }
+			w.callbacks.published = func(int64, int64) { published <- struct{}{} }
 			_ = w.start(context.Background())
 			if operation != opMkdir && !w.tryEnqueue([]byte("abc\n")) {
 				t.Fatal("enqueue rejected")
@@ -260,7 +256,7 @@ func TestStreamWriterFailureRecoveryMatrix(t *testing.T) {
 func TestStreamWriterChmodFailureRemovesOwnedTemp(t *testing.T) {
 	dir := t.TempDir()
 	ops := &faultFileOps{base: osFileOps{}, chmodFailures: 1, failures: map[fileOperation]int{}}
-	w := newStreamWriter(candidateAction, dir, 64)
+	w := newStreamWriter(dir, 64)
 	w.ops = ops
 	_ = w.start(context.Background())
 	if !w.tryEnqueue([]byte("abc\n")) {
@@ -288,7 +284,7 @@ func TestStreamWriterRemoveFailureBlocksNewTemp(t *testing.T) {
 	dir := t.TempDir()
 	clock := newManualClock()
 	ops := &faultFileOps{base: osFileOps{}, failures: map[fileOperation]int{opWrite: 1, opRemoveTmp: 1}}
-	w := newStreamWriter(candidateAction, dir, 64)
+	w := newStreamWriter(dir, 64)
 	w.ops, w.clock, w.maxFileBytes = ops, clock, 4
 	_ = w.start(context.Background())
 	if !w.tryEnqueue([]byte("abc\n")) {
@@ -310,7 +306,7 @@ func TestStreamWriterRenameRetriesSameClosedTemp(t *testing.T) {
 	dir := t.TempDir()
 	clock := newManualClock()
 	ops := &faultFileOps{base: osFileOps{}, failures: map[fileOperation]int{opRename: 1}}
-	w := newStreamWriter(candidateAction, dir, 64)
+	w := newStreamWriter(dir, 64)
 	w.ops, w.clock, w.maxFileBytes = ops, clock, 4
 	_ = w.start(context.Background())
 	_ = w.tryEnqueue([]byte("abc\n"))
@@ -331,23 +327,18 @@ func TestStreamWriterRenameRetriesSameClosedTemp(t *testing.T) {
 	w.shutdown(context.Background())
 }
 
-func TestStreamWriterShutdownDeadlineAndIndependentProgress(t *testing.T) {
+func TestStreamWriterShutdownDeadlinePreservesReservation(t *testing.T) {
+	dir := t.TempDir()
 	blockedOps := &faultFileOps{base: osFileOps{}, failures: map[fileOperation]int{opRename: 100}}
-	blocked := newStreamWriter(candidateAction, t.TempDir(), 64)
+	blocked := newStreamWriter(dir, 64)
 	blocked.ops, blocked.maxFileBytes, blocked.maxBatchAge = blockedOps, 4, time.Hour
 	deadline := make(chan [2]int64, 1)
-	blocked.callbacks.shutdownDeadline = func(_ candidateType, records, bytes int64) { deadline <- [2]int64{records, bytes} }
+	blocked.callbacks.shutdownDeadline = func(records, bytes int64) {
+		deadline <- [2]int64{records, bytes}
+	}
 	_ = blocked.start(context.Background())
 	_ = blocked.tryEnqueue([]byte("abc\n"))
 	waitUntil(t, func() bool { return blocked.snapshot().state == streamDegraded })
-
-	otherPublished := make(chan struct{}, 1)
-	other := newStreamWriter(candidateTranscript, t.TempDir(), 64)
-	other.maxFileBytes = 4
-	other.callbacks.published = func(candidateType, int64, int64) { otherPublished <- struct{}{} }
-	_ = other.start(context.Background())
-	_ = other.tryEnqueue([]byte("xyz\n"))
-	waitSignal(t, otherPublished)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -360,16 +351,15 @@ func TestStreamWriterShutdownDeadlineAndIndependentProgress(t *testing.T) {
 	default:
 		t.Fatal("shutdown deadline was not reported")
 	}
-	if got := blocked.snapshot(); got.unpublishedBytes != 4 {
+	if got := blocked.snapshot(); got.unpublishedRecords != 1 || got.unpublishedBytes != 4 {
 		t.Fatalf("blocked reservation released: %+v", got)
 	}
-	other.shutdown(context.Background())
 }
 
 func TestStreamWriterRecoveryBackoffCapsAndSuppressesRepeatedEdges(t *testing.T) {
 	var degradedEdges int
-	w := newStreamWriter(candidateAction, t.TempDir(), 64)
-	w.callbacks.stateChanged = func(_ candidateType, _ streamState, to streamState, _ fileOperation) {
+	w := newStreamWriter(t.TempDir(), 64)
+	w.callbacks.stateChanged = func(_ streamState, to streamState, _ fileOperation) {
 		if to == streamDegraded {
 			degradedEdges++
 		}
@@ -394,9 +384,9 @@ func TestStreamWriterRecoveryPreservesBatchAge(t *testing.T) {
 	clock := newManualClock()
 	ops := &faultFileOps{base: osFileOps{}, failures: map[fileOperation]int{}}
 	published := make(chan struct{}, 1)
-	w := newStreamWriter(candidateAction, dir, 64)
+	w := newStreamWriter(dir, 64)
 	w.ops, w.clock, w.maxFileBytes, w.maxBatchAge = ops, clock, 64, 30*time.Second
-	w.callbacks.published = func(candidateType, int64, int64) { published <- struct{}{} }
+	w.callbacks.published = func(int64, int64) { published <- struct{}{} }
 	if err := w.start(context.Background()); err != nil {
 		t.Fatalf("start: %v", err)
 	}
@@ -440,9 +430,9 @@ func TestStreamWriterRecoveryPreservesBatchAge(t *testing.T) {
 func TestStreamWriterReadyBacklogNoticesExternalDeletion(t *testing.T) {
 	dir := t.TempDir()
 	published := make(chan struct{}, 1)
-	w := newStreamWriter(candidateAction, dir, 64)
+	w := newStreamWriter(dir, 64)
 	w.maxFileBytes = 4
-	w.callbacks.published = func(candidateType, int64, int64) { published <- struct{}{} }
+	w.callbacks.published = func(int64, int64) { published <- struct{}{} }
 	_ = w.start(context.Background())
 	_ = w.tryEnqueue([]byte("abc\n"))
 	waitSignal(t, published)

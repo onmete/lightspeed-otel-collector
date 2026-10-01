@@ -63,10 +63,10 @@ type streamSnapshot struct {
 }
 
 type streamCallbacks struct {
-	stateChanged     func(candidateType, streamState, streamState, fileOperation)
-	operationFailed  func(candidateType, fileOperation)
-	published        func(candidateType, int64, int64)
-	shutdownDeadline func(candidateType, int64, int64)
+	stateChanged     func(streamState, streamState, fileOperation)
+	operationFailed  func(fileOperation)
+	published        func(int64, int64)
+	shutdownDeadline func(int64, int64)
 }
 
 type fileOps interface {
@@ -155,7 +155,6 @@ type shutdownRequest struct {
 }
 
 type streamWriter struct {
-	candidate       candidateType
 	directory       string
 	maxBacklogBytes int64
 	maxFileBytes    int64
@@ -198,21 +197,25 @@ type streamWriter struct {
 	backoff             time.Duration
 }
 
-func newStreamWriter(candidate candidateType, directory string, maxBacklogBytes int64) *streamWriter {
+func newStreamWriter(directory string, maxBacklogBytes int64) *streamWriter {
 	return &streamWriter{
-		candidate: candidate, directory: directory,
-		maxBacklogBytes: maxBacklogBytes,
-		maxFileBytes:    maxFileBytes,
-		maxBatchAge:     maxBatchAge,
-		ops:             osFileOps{}, clock: realWriterClock{},
+		directory:         directory,
+		maxBacklogBytes:   maxBacklogBytes,
+		maxFileBytes:      maxFileBytes,
+		maxBatchAge:       maxBatchAge,
+		ops:               osFileOps{},
+		clock:             realWriterClock{},
 		state:             streamUnavailable,
 		operationFailures: make(map[fileOperation]int64),
-		notify:            make(chan struct{}, 1), shutdownRequests: make(chan shutdownRequest, 1),
-		accepting: true,
-		backoff:   recoveryInitialBackoff,
+		notify:            make(chan struct{}, 1),
+		shutdownRequests:  make(chan shutdownRequest, 1),
+		accepting:         true,
+		backoff:           recoveryInitialBackoff,
 	}
 }
 
+// On success, tryEnqueue takes immutable ownership of record. On failure,
+// ownership remains with the caller.
 func (w *streamWriter) tryEnqueue(record []byte) bool {
 	if len(record) == 0 || record[len(record)-1] != '\n' {
 		return false
@@ -223,10 +226,9 @@ func (w *streamWriter) tryEnqueue(record []byte) bool {
 		w.mu.Unlock()
 		return false
 	}
-	copyOfRecord := append([]byte(nil), record...)
-	w.queued = append(w.queued, queuedRecord{data: copyOfRecord})
+	w.queued = append(w.queued, queuedRecord{data: record})
 	w.unpublishedRecords++
-	w.unpublishedBytes += int64(len(copyOfRecord))
+	w.unpublishedBytes += int64(len(record))
 	if w.unpublishedBytes > w.highWaterBytes {
 		w.highWaterBytes = w.unpublishedBytes
 	}
@@ -266,7 +268,7 @@ func (w *streamWriter) shutdownWriter(ctx context.Context) {
 	w.mu.Unlock()
 	if !started {
 		if records != 0 && w.callbacks.shutdownDeadline != nil {
-			w.callbacks.shutdownDeadline(w.candidate, records, bytes)
+			w.callbacks.shutdownDeadline(records, bytes)
 		}
 		return
 	}
@@ -528,7 +530,7 @@ func (w *streamWriter) publishActive() bool {
 	w.file, w.tempPath, w.readyPath, w.closed = nil, "", "", false
 	w.refreshReadyBacklog()
 	if w.callbacks.published != nil {
-		w.callbacks.published(w.candidate, records, bytes)
+		w.callbacks.published(records, bytes)
 	}
 	return true
 }
@@ -638,7 +640,7 @@ func (w *streamWriter) probeRecovery() bool {
 		w.recover()
 		w.refreshReadyBacklog()
 		if w.callbacks.published != nil {
-			w.callbacks.published(w.candidate, records, bytes)
+			w.callbacks.published(records, bytes)
 		}
 		return true
 	}
@@ -673,7 +675,7 @@ func (w *streamWriter) fail(operation fileOperation) {
 		}
 	}
 	if from != streamDegraded && w.callbacks.stateChanged != nil {
-		w.callbacks.stateChanged(w.candidate, from, streamDegraded, operation)
+		w.callbacks.stateChanged(from, streamDegraded, operation)
 	}
 }
 
@@ -682,7 +684,7 @@ func (w *streamWriter) recordFailure(operation fileOperation) {
 	w.operationFailures[operation]++
 	w.mu.Unlock()
 	if w.callbacks.operationFailed != nil {
-		w.callbacks.operationFailed(w.candidate, operation)
+		w.callbacks.operationFailed(operation)
 	}
 }
 
@@ -694,7 +696,7 @@ func (w *streamWriter) recover() {
 	w.mu.Unlock()
 	w.failedOp = ""
 	if from != streamHealthy && w.callbacks.stateChanged != nil {
-		w.callbacks.stateChanged(w.candidate, from, streamHealthy, "")
+		w.callbacks.stateChanged(from, streamHealthy, "")
 	}
 }
 
@@ -774,7 +776,7 @@ func (w *streamWriter) reportShutdownDeadline() {
 	w.shutdownReported = true
 	w.mu.Unlock()
 	if w.callbacks.shutdownDeadline != nil {
-		w.callbacks.shutdownDeadline(w.candidate, records, bytes)
+		w.callbacks.shutdownDeadline(records, bytes)
 	}
 }
 

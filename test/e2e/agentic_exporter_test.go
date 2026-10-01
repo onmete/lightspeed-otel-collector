@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -21,35 +22,73 @@ import (
 )
 
 const (
-	fixtureAgenticRunUID = "550e8400-e29b-41d4-a716-446655440000"
-	fixtureTraceIDHex    = "00112233445566778899aabbccddeeff"
-	fixtureSpanIDHex     = "0123456789abcdef"
-	fixtureSpanName      = "e2e-agentic-operation"
-	transcriptEventName  = "gen_ai.input"
-	fallbackEventName    = "agenticrun.execution.completed"
-	privatePayloadPrefix = "E2E_PRIVATE_PAYLOAD:"
+	fixtureAgenticRunUID           = "550e8400-e29b-41d4-a716-446655440000"
+	fixtureTraceIDHex              = "00112233445566778899aabbccddeeff"
+	fixtureSpanIDHex               = "0123456789abcdef"
+	fixtureParentSpanIDHex         = "fedcba9876543210"
+	fixtureSpanName                = "e2e-agentic-operation"
+	fixtureResourceSchemaURL       = "https://example.com/ols/e2e/resource/v1"
+	fixtureScopeSchemaURL          = "https://example.com/ols/e2e/scope/v1"
+	fixtureSpanStartTimeUnixNano   = uint64(1_700_000_000_000_000_000)
+	fixtureSpanEndTimeUnixNano     = uint64(1_700_000_000_000_000_010)
+	fixtureFirstEventTimeUnixNano  = uint64(1_700_000_000_000_000_003)
+	fixtureSecondEventTimeUnixNano = uint64(1_700_000_000_000_000_007)
+	firstActionEventName           = "agenticrun.execution.started"
+	fallbackEventName              = "agenticrun.execution.completed"
+	privatePayloadPrefix           = "E2E_PRIVATE_PAYLOAD:"
 )
 
 type agenticJSONValue struct {
 	StringValue *string `json:"stringValue,omitempty"`
+	IntValue    *string `json:"intValue,omitempty"`
 }
 
-type agenticJSONRecord struct {
-	SchemaVersion string `json:"schema_version"`
-	CandidateType string `json:"candidate_type"`
-	RecordKind    string `json:"record_kind"`
-	AgenticRunUID string `json:"agenticrun_uid"`
-	Phase         string `json:"phase"`
-	TraceID       string `json:"trace_id"`
-	SpanID        string `json:"span_id"`
-	EventIndex    *int   `json:"event_index"`
-	ServiceName   string `json:"service_name"`
-	Name          string `json:"name"`
-	Attributes    struct {
-		Resource map[string]agenticJSONValue `json:"resource"`
-		Span     map[string]agenticJSONValue `json:"span"`
-		Event    map[string]agenticJSONValue `json:"event"`
-	} `json:"attributes"`
+type agenticJSONAttribute struct {
+	Key   string           `json:"key"`
+	Value agenticJSONValue `json:"value"`
+}
+
+type agenticJSONResource struct {
+	Attributes []agenticJSONAttribute `json:"attributes"`
+}
+
+type agenticJSONScope struct {
+	Name    string `json:"name"`
+	Version string `json:"version"`
+}
+
+type agenticJSONEvent struct {
+	TimeUnixNano string                 `json:"timeUnixNano"`
+	Name         string                 `json:"name"`
+	Attributes   []agenticJSONAttribute `json:"attributes"`
+}
+
+type agenticJSONSpan struct {
+	TraceID           string                 `json:"traceId"`
+	SpanID            string                 `json:"spanId"`
+	ParentSpanID      string                 `json:"parentSpanId"`
+	Name              string                 `json:"name"`
+	Kind              int32                  `json:"kind"`
+	StartTimeUnixNano string                 `json:"startTimeUnixNano"`
+	EndTimeUnixNano   string                 `json:"endTimeUnixNano"`
+	Attributes        []agenticJSONAttribute `json:"attributes"`
+	Events            []agenticJSONEvent     `json:"events"`
+}
+
+type agenticJSONScopeSpans struct {
+	SchemaURL string            `json:"schemaUrl"`
+	Scope     agenticJSONScope  `json:"scope"`
+	Spans     []agenticJSONSpan `json:"spans"`
+}
+
+type agenticJSONResourceSpans struct {
+	SchemaURL  string                  `json:"schemaUrl"`
+	Resource   agenticJSONResource     `json:"resource"`
+	ScopeSpans []agenticJSONScopeSpans `json:"scopeSpans"`
+}
+
+type agenticJSONDocument struct {
+	ResourceSpans []agenticJSONResourceSpans `json:"resourceSpans"`
 }
 
 type agenticTraceFixture struct {
@@ -58,47 +97,42 @@ type agenticTraceFixture struct {
 }
 
 func TestAgenticExporterRuntime(t *testing.T) {
-	testStarted := time.Now().Add(-time.Second)
 	podBefore := collectorPodName(t)
 
 	happy := newAgenticTraceFixture("happy")
+	happyLogWindowStart := time.Now().Add(-time.Minute)
+	happyDebugEntriesBefore := debugTraceEntryCount(collectorLogsSince(t, happyLogWindowStart))
 	sendAgenticTrace(t, happy)
 
-	actionRecords := waitForAgenticRecords(t, "actions", happy.marker, 2, 15*time.Second)
-	transcriptRecords := waitForAgenticRecords(t, "transcripts", happy.marker, 1, 15*time.Second)
-	assertHappyAgenticRecords(t, happy, actionRecords, transcriptRecords)
-	waitForDebugTrace(t, testStarted, 10*time.Second)
+	happyDocuments := waitForAgenticDocuments(t, happy.marker, 1, 15*time.Second)
+	assertHappyAgenticDocument(t, happy, happyDocuments)
+	waitForDebugTrace(t, happyLogWindowStart, happyDebugEntriesBefore, 10*time.Second)
 	assertCollectorHealthy(t)
 
-	setCollectorStreamDirectoryMode(t, "actions", "0550")
-	actionsWritable := false
+	setCollectorTraceDirectoryMode(t, "0550")
+	traceDirectoryWritable := false
 	defer func() {
-		if !actionsWritable {
-			setCollectorStreamDirectoryMode(t, "actions", "0770")
+		if !traceDirectoryWritable {
+			setCollectorTraceDirectoryMode(t, "0770")
 		}
 	}()
 
-	failureStarted := time.Now().Add(-time.Second)
-	failure := newAgenticTraceFixture("actions-failure")
+	failure := newAgenticTraceFixture("failure")
+	failureLogWindowStart := time.Now().Add(-time.Minute)
+	failureDebugEntriesBefore := debugTraceEntryCount(collectorLogsSince(t, failureLogWindowStart))
 	sendAgenticTrace(t, failure)
 
-	failureTranscripts := waitForAgenticRecords(t, "transcripts", failure.marker, 1, 15*time.Second)
-	if got := failureTranscripts[0].CandidateType; got != "transcript" {
-		t.Fatalf("failure-isolation candidate_type = %q, want transcript", got)
-	}
-	waitForDebugTrace(t, failureStarted, 10*time.Second)
+	waitForDebugTrace(t, failureLogWindowStart, failureDebugEntriesBefore, 10*time.Second)
 	assertCollectorHealthy(t)
-	assertMarkerAbsent(t, "actions", failure.marker)
-	assertContentFreeCollectorLogs(t, failureStarted, failure)
+	assertAgenticMarkerAbsent(t, failure.marker)
+	assertContentFreeCollectorLogs(t, failureLogWindowStart, failure)
 
-	setCollectorStreamDirectoryMode(t, "actions", "0770")
-	actionsWritable = true
-	recoveredActions := waitForAgenticRecords(t, "actions", failure.marker, 2, 45*time.Second)
-	if len(recoveredActions) != 2 {
-		t.Fatalf("recovered action records = %d, want 2", len(recoveredActions))
-	}
+	setCollectorTraceDirectoryMode(t, "0770")
+	traceDirectoryWritable = true
+	recoveredDocuments := waitForAgenticDocuments(t, failure.marker, 1, 45*time.Second)
+	assertHappyAgenticDocument(t, failure, recoveredDocuments)
 	if podAfter := collectorPodName(t); podAfter != podBefore {
-		t.Fatalf("collector restarted during stream recovery: before=%s after=%s", podBefore, podAfter)
+		t.Fatalf("collector restarted during spool recovery: before=%s after=%s", podBefore, podAfter)
 	}
 	assertCollectorHealthy(t)
 }
@@ -134,33 +168,37 @@ func sendAgenticTrace(t *testing.T, fixture agenticTraceFixture) {
 	if err != nil {
 		t.Fatalf("decode span ID: %v", err)
 	}
+	parentSpanID, err := hex.DecodeString(fixtureParentSpanIDHex)
+	if err != nil {
+		t.Fatalf("decode parent span ID: %v", err)
+	}
 
-	now := uint64(time.Now().UnixNano())
 	span := &tracepb.Span{
 		TraceId:           traceID,
 		SpanId:            spanID,
+		ParentSpanId:      parentSpanID,
 		Name:              fixtureSpanName,
 		Kind:              tracepb.Span_SPAN_KIND_INTERNAL,
-		StartTimeUnixNano: now,
-		EndTimeUnixNano:   now + uint64(time.Millisecond),
+		StartTimeUnixNano: fixtureSpanStartTimeUnixNano,
+		EndTimeUnixNano:   fixtureSpanEndTimeUnixNano,
 		Attributes: []*commonpb.KeyValue{
 			stringAttribute("agenticrun.uid", fixtureAgenticRunUID),
 			stringAttribute("agenticrun.phase", "execution"),
 			stringAttribute("e2e.payload", fixture.payload),
+			intAttribute("gen_ai.usage.input_tokens", 42),
+			stringAttribute("gen_ai.operation.name", "chat"),
+			stringAttribute("gen_ai.input.messages", `[{"role":"user","parts":[{"type":"text","content":"request-original"}]}]`),
 		},
 		Events: []*tracepb.Span_Event{
 			{
-				TimeUnixNano: now + 1,
-				Name:         transcriptEventName,
+				TimeUnixNano: fixtureFirstEventTimeUnixNano,
+				Name:         firstActionEventName,
 				Attributes: []*commonpb.KeyValue{
-					stringAttribute("gen_ai.input.system_prompt", "system-original"),
-					stringAttribute("gen_ai.input.prompt", "prompt-original"),
-					stringAttribute("gen_ai.input.context", "context-original"),
-					stringAttribute("gen_ai.input.output_schema", "schema-original"),
+					stringAttribute("input.kind", "original"),
 				},
 			},
 			{
-				TimeUnixNano: now + 2,
+				TimeUnixNano: fixtureSecondEventTimeUnixNano,
 				Name:         fallbackEventName,
 				Attributes: []*commonpb.KeyValue{
 					stringAttribute("result.uid", "result-original"),
@@ -172,14 +210,16 @@ func sendAgenticTrace(t *testing.T, fixture agenticTraceFixture) {
 	request := &collectortracepb.ExportTraceServiceRequest{
 		ResourceSpans: []*tracepb.ResourceSpans{
 			{
+				SchemaUrl: fixtureResourceSchemaURL,
 				Resource: &resourcepb.Resource{Attributes: []*commonpb.KeyValue{
 					stringAttribute("service.name", "lightspeed-agentic-sandbox"),
 					stringAttribute("e2e.source_marker", fixture.marker),
 				}},
 				ScopeSpans: []*tracepb.ScopeSpans{
 					{
-						Scope: &commonpb.InstrumentationScope{Name: "agentic-e2e", Version: "1.0"},
-						Spans: []*tracepb.Span{span},
+						SchemaUrl: fixtureScopeSchemaURL,
+						Scope:     &commonpb.InstrumentationScope{Name: "agentic-e2e", Version: "1.0"},
+						Spans:     []*tracepb.Span{span},
 					},
 				},
 			},
@@ -208,109 +248,155 @@ func stringAttribute(key, value string) *commonpb.KeyValue {
 	}
 }
 
-func waitForAgenticRecords(
+func intAttribute(key string, value int64) *commonpb.KeyValue {
+	return &commonpb.KeyValue{
+		Key: key,
+		Value: &commonpb.AnyValue{
+			Value: &commonpb.AnyValue_IntValue{IntValue: value},
+		},
+	}
+}
+
+func waitForAgenticDocuments(
 	t *testing.T,
-	stream, marker string,
+	marker string,
 	want int,
 	timeout time.Duration,
-) []agenticJSONRecord {
-	t.Helper()
-	lines := waitForJSONLOutput(t, stream, func(line string) bool {
-		var record agenticJSONRecord
-		return json.Unmarshal([]byte(line), &record) == nil && recordMarker(record) == marker
-	}, want, timeout)
-
-	records := make([]agenticJSONRecord, 0, len(lines))
-	for _, line := range lines {
-		var record agenticJSONRecord
-		if err := json.Unmarshal([]byte(line), &record); err != nil {
-			t.Fatalf("decode %s JSONL: %v", stream, err)
-		}
-		records = append(records, record)
-	}
-	return records
-}
-
-func recordMarker(record agenticJSONRecord) string {
-	value := record.Attributes.Resource["e2e.source_marker"].StringValue
-	if value == nil {
-		return ""
-	}
-	return *value
-}
-
-func assertHappyAgenticRecords(
-	t *testing.T,
-	fixture agenticTraceFixture,
-	actions, transcripts []agenticJSONRecord,
-) {
-	t.Helper()
-	all := append(append([]agenticJSONRecord(nil), actions...), transcripts...)
-	for _, record := range all {
-		if record.SchemaVersion != "1.0" {
-			t.Fatalf("schema_version = %q, want 1.0", record.SchemaVersion)
-		}
-		if record.AgenticRunUID != fixtureAgenticRunUID || record.Phase != "execution" ||
-			record.TraceID != fixtureTraceIDHex || record.SpanID != fixtureSpanIDHex ||
-			record.ServiceName != "lightspeed-agentic-sandbox" {
-			t.Fatalf("record identity/projection mismatch for %s/%s", record.RecordKind, record.Name)
-		}
-		if recordMarker(record) != fixture.marker {
-			t.Fatalf("source marker = %q, want %q", recordMarker(record), fixture.marker)
-		}
-		payload := record.Attributes.Span["e2e.payload"].StringValue
-		if payload == nil || *payload != fixture.payload {
-			t.Fatal("span payload was not preserved exactly")
-		}
-	}
-
-	var sawSpan, sawFallback bool
-	for _, record := range actions {
-		if record.CandidateType != "action" {
-			t.Fatalf("Actions candidate_type = %q", record.CandidateType)
-		}
-		switch record.RecordKind {
-		case "span":
-			sawSpan = record.Name == fixtureSpanName && record.EventIndex == nil
-		case "span_event":
-			result := record.Attributes.Event["result.uid"].StringValue
-			sawFallback = record.Name == fallbackEventName && record.EventIndex != nil &&
-				*record.EventIndex == 1 && result != nil && *result == "result-original"
-		}
-	}
-	if !sawSpan || !sawFallback {
-		t.Fatalf("Actions missing projected span/fallback event: span=%t fallback=%t", sawSpan, sawFallback)
-	}
-
-	transcript := transcripts[0]
-	if transcript.CandidateType != "transcript" || transcript.RecordKind != "span_event" ||
-		transcript.Name != transcriptEventName || transcript.EventIndex == nil ||
-		*transcript.EventIndex != 0 {
-		t.Fatal("Transcript envelope or original event index mismatch")
-	}
-	for key, want := range map[string]string{
-		"gen_ai.input.system_prompt": "system-original",
-		"gen_ai.input.prompt":        "prompt-original",
-		"gen_ai.input.context":       "context-original",
-		"gen_ai.input.output_schema": "schema-original",
-	} {
-		got := transcript.Attributes.Event[key].StringValue
-		if got == nil || *got != want {
-			t.Fatalf("Transcript attribute %q was not preserved", key)
-		}
-	}
-}
-
-func waitForDebugTrace(t *testing.T, since time.Time, timeout time.Duration) {
+) []agenticJSONDocument {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		if strings.Contains(collectorLogsSince(t, since), "Traces") {
+		var matching []agenticJSONDocument
+		for _, name := range listCollectorJSONL(t) {
+			for _, line := range readCollectorJSONLLines(t, name) {
+				var document agenticJSONDocument
+				if err := json.Unmarshal([]byte(line), &document); err != nil {
+					t.Fatalf("decode native OTLP JSONL document in %q: %v", name, err)
+				}
+				if recordMarker(document) == marker {
+					matching = append(matching, document)
+				}
+			}
+		}
+		if len(matching) >= want {
+			return matching
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %d matching native OTLP JSONL documents", want)
+	return nil
+}
+
+func recordMarker(document agenticJSONDocument) string {
+	for _, resourceSpans := range document.ResourceSpans {
+		value, ok := agenticAttributeValue(resourceSpans.Resource.Attributes, "e2e.source_marker")
+		if ok && value.StringValue != nil {
+			return *value.StringValue
+		}
+	}
+	return ""
+}
+
+func agenticAttributeValue(attributes []agenticJSONAttribute, key string) (agenticJSONValue, bool) {
+	for _, attribute := range attributes {
+		if attribute.Key == key {
+			return attribute.Value, true
+		}
+	}
+	return agenticJSONValue{}, false
+}
+
+func assertStringAttribute(t *testing.T, attributes []agenticJSONAttribute, key, want string) {
+	t.Helper()
+	value, ok := agenticAttributeValue(attributes, key)
+	if !ok || value.StringValue == nil || *value.StringValue != want {
+		t.Fatalf("string attribute %q was not preserved", key)
+	}
+}
+
+func assertIntAttribute(t *testing.T, attributes []agenticJSONAttribute, key, want string) {
+	t.Helper()
+	value, ok := agenticAttributeValue(attributes, key)
+	if !ok || value.IntValue == nil || *value.IntValue != want {
+		t.Fatalf("integer attribute %q was not preserved as an int", key)
+	}
+}
+
+func assertHappyAgenticDocument(t *testing.T, fixture agenticTraceFixture, documents []agenticJSONDocument) {
+	t.Helper()
+	if len(documents) != 1 {
+		t.Fatalf("native documents = %d, want one span document", len(documents))
+	}
+	document := documents[0]
+	if len(document.ResourceSpans) != 1 {
+		t.Fatalf("resourceSpans = %d, want one resource context", len(document.ResourceSpans))
+	}
+	resource := document.ResourceSpans[0]
+	if len(resource.ScopeSpans) != 1 {
+		t.Fatalf("scopeSpans = %d, want one instrumentation scope", len(resource.ScopeSpans))
+	}
+	scope := resource.ScopeSpans[0]
+	if len(scope.Spans) != 1 {
+		t.Fatalf("spans = %d, want one source span", len(scope.Spans))
+	}
+	span := scope.Spans[0]
+
+	assertStringAttribute(t, resource.Resource.Attributes, "service.name", "lightspeed-agentic-sandbox")
+	assertStringAttribute(t, resource.Resource.Attributes, "e2e.source_marker", fixture.marker)
+	if resource.SchemaURL != fixtureResourceSchemaURL || scope.SchemaURL != fixtureScopeSchemaURL {
+		t.Fatal("resource or scope schema URL was not preserved")
+	}
+	if span.TraceID != fixtureTraceIDHex || span.SpanID != fixtureSpanIDHex ||
+		span.ParentSpanID != fixtureParentSpanIDHex || span.Name != fixtureSpanName ||
+		span.Kind != int32(tracepb.Span_SPAN_KIND_INTERNAL) {
+		t.Fatal("span identity, parent, name, or kind was not preserved")
+	}
+	if span.StartTimeUnixNano != strconv.FormatUint(fixtureSpanStartTimeUnixNano, 10) ||
+		span.EndTimeUnixNano != strconv.FormatUint(fixtureSpanEndTimeUnixNano, 10) {
+		t.Fatal("span timestamps were not preserved")
+	}
+	assertStringAttribute(t, span.Attributes, "agenticrun.uid", fixtureAgenticRunUID)
+	assertStringAttribute(t, span.Attributes, "agenticrun.phase", "execution")
+	assertStringAttribute(t, span.Attributes, "e2e.payload", fixture.payload)
+	assertStringAttribute(t, span.Attributes, "gen_ai.operation.name", "chat")
+	assertStringAttribute(t, span.Attributes, "gen_ai.input.messages",
+		`[{"role":"user","parts":[{"type":"text","content":"request-original"}]}]`)
+	assertIntAttribute(t, span.Attributes, "gen_ai.usage.input_tokens", "42")
+
+	if len(span.Events) != 2 {
+		t.Fatalf("span events = %d, want both source events", len(span.Events))
+	}
+	if span.Events[0].Name != firstActionEventName || span.Events[1].Name != fallbackEventName {
+		t.Fatal("source event order or names were not preserved")
+	}
+	if span.Events[0].TimeUnixNano != strconv.FormatUint(fixtureFirstEventTimeUnixNano, 10) ||
+		span.Events[1].TimeUnixNano != strconv.FormatUint(fixtureSecondEventTimeUnixNano, 10) {
+		t.Fatal("source event timestamps were not preserved")
+	}
+	assertStringAttribute(t, span.Events[0].Attributes, "input.kind", "original")
+	assertStringAttribute(t, span.Events[1].Attributes, "result.uid", "result-original")
+}
+
+func debugTraceEntryCount(logs string) int {
+	count := 0
+	for _, line := range strings.Split(logs, "\n") {
+		if strings.Contains(line, "Traces") {
+			count++
+		}
+	}
+	return count
+}
+
+func waitForDebugTrace(t *testing.T, since time.Time, entriesBefore int, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if debugTraceEntryCount(collectorLogsSince(t, since)) > entriesBefore {
 			return
 		}
 		time.Sleep(250 * time.Millisecond)
 	}
-	t.Fatal("debug exporter did not report the trace fan-out")
+	t.Fatalf("debug exporter trace-entry count did not advance past %d", entriesBefore)
 }
 
 func assertCollectorHealthy(t *testing.T) {
@@ -326,11 +412,13 @@ func assertCollectorHealthy(t *testing.T) {
 	}
 }
 
-func assertMarkerAbsent(t *testing.T, stream, marker string) {
+func assertAgenticMarkerAbsent(t *testing.T, marker string) {
 	t.Helper()
-	for _, name := range listCollectorJSONL(t, stream) {
-		if strings.Contains(readCollectorJSONL(t, stream, name), marker) {
-			t.Fatalf("%s stream published marker %q while its directory was read-only", stream, marker)
+	for _, name := range listCollectorJSONL(t) {
+		for _, line := range readCollectorJSONLLines(t, name) {
+			if strings.Contains(line, marker) {
+				t.Fatalf("traces directory published marker %q while it was read-only", marker)
+			}
 		}
 	}
 }
@@ -350,11 +438,11 @@ func assertContentFreeCollectorLogs(t *testing.T, since time.Time, fixture agent
 		fixtureAgenticRunUID,
 		fixtureTraceIDHex,
 		fixtureSpanIDHex,
+		fixtureParentSpanIDHex,
 		fixtureSpanName,
-		transcriptEventName,
 		fallbackEventName,
 		privatePayloadPrefix,
-		"prompt-original",
+		"request-original",
 		"result-original",
 	} {
 		if strings.Contains(logs, secret) {

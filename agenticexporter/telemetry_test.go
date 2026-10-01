@@ -2,6 +2,7 @@ package agenticexporter
 
 import (
 	"context"
+	"reflect"
 	"testing"
 
 	"go.opentelemetry.io/collector/component"
@@ -20,18 +21,17 @@ func TestTelemetryContract(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newTelemetry() error = %v", err)
 	}
-	actions := newStreamWriter(candidateAction, t.TempDir(), 1024)
-	transcripts := newStreamWriter(candidateTranscript, t.TempDir(), 1024)
-	if err := tel.registerWriters(actions, transcripts); err != nil {
-		t.Fatalf("registerWriters() error = %v", err)
+	writer := newStreamWriter(t.TempDir(), 1024)
+	if err := tel.registerWriter(writer); err != nil {
+		t.Fatalf("registerWriter() error = %v", err)
 	}
 	t.Cleanup(tel.close)
 
 	ctx := context.Background()
-	tel.recordCandidate(ctx, candidateAction, recordSpan, "lightspeed-agentic-operator", 37)
-	tel.recordRejection(ctx, candidateTranscript, recordSpanEvent, "secret-service", rejectQueueFull)
-	tel.recordPublished(ctx, candidateAction, 2, 74)
-	tel.recordFileOperationFailure(ctx, candidateTranscript, opRename)
+	tel.recordAdmission(ctx, "lightspeed-agentic-operator", 37)
+	tel.recordRejection(ctx, "secret-service", rejectQueueFull)
+	tel.recordPublished(ctx, 2, 74)
+	tel.recordFileOperationFailure(ctx, opRename)
 
 	var collected metricdata.ResourceMetrics
 	if err := reader.Collect(ctx, &collected); err != nil {
@@ -57,11 +57,9 @@ func TestTelemetryContract(t *testing.T) {
 		"otelcol_agentic_exporter_stream_state":            false,
 	}
 	allowedKeys := map[attribute.Key]bool{
-		"candidate_type": true,
-		"record_kind":    true,
-		"service_name":   true,
-		"reason":         true,
-		"operation":      true,
+		"service_name": true,
+		"reason":       true,
+		"operation":    true,
 	}
 	for _, scope := range collected.ScopeMetrics {
 		if scope.Scope.Name != meterScope {
@@ -92,7 +90,7 @@ func TestTelemetryContract(t *testing.T) {
 		}
 	}
 	if got := int64MetricSum(collected, "otelcol_agentic_exporter_candidates"); got != 1 {
-		t.Errorf("candidate counter = %d, want 1", got)
+		t.Errorf("admission counter = %d, want 1", got)
 	}
 	if got := int64MetricSum(collected, "otelcol_agentic_exporter_rejections"); got != 1 {
 		t.Errorf("rejection counter = %d, want 1", got)
@@ -111,6 +109,44 @@ func TestTelemetryContract(t *testing.T) {
 	}
 	if got := int64HistogramSum(collected, "otelcol_agentic_exporter_record_size"); got != 37 {
 		t.Errorf("record size histogram sum = %d, want 37", got)
+	}
+	expectedLabels := map[string]map[attribute.Key]string{
+		"otelcol_agentic_exporter_candidates":              {"service_name": "lightspeed-agentic-operator"},
+		"otelcol_agentic_exporter_rejections":              {"reason": string(rejectQueueFull)},
+		"otelcol_agentic_exporter_record_size":             {"service_name": "lightspeed-agentic-operator"},
+		"otelcol_agentic_exporter_ready_files_created":     {},
+		"otelcol_agentic_exporter_ready_records_created":   {},
+		"otelcol_agentic_exporter_ready_bytes_created":     {},
+		"otelcol_agentic_exporter_file_operation_failures": {"operation": string(opRename)},
+	}
+	for name := range wantNames {
+		if name == "otelcol_agentic_exporter_candidates" ||
+			name == "otelcol_agentic_exporter_rejections" ||
+			name == "otelcol_agentic_exporter_record_size" ||
+			name == "otelcol_agentic_exporter_ready_files_created" ||
+			name == "otelcol_agentic_exporter_ready_records_created" ||
+			name == "otelcol_agentic_exporter_ready_bytes_created" ||
+			name == "otelcol_agentic_exporter_file_operation_failures" {
+			continue
+		}
+		expectedLabels[name] = map[attribute.Key]string{}
+	}
+	for _, scope := range collected.ScopeMetrics {
+		for _, measured := range scope.Metrics {
+			expected, tracked := expectedLabels[measured.Name]
+			if !tracked {
+				continue
+			}
+			for _, attrs := range metricAttributeSets(measured.Data) {
+				got := make(map[attribute.Key]string)
+				for _, kv := range attrs.ToSlice() {
+					got[kv.Key] = kv.Value.AsString()
+				}
+				if !reflect.DeepEqual(got, expected) {
+					t.Errorf("%s attributes = %v, want %v", measured.Name, got, expected)
+				}
+			}
+		}
 	}
 }
 
@@ -198,10 +234,10 @@ func TestTelemetryRecordsWithoutTraceExemplars(t *testing.T) {
 		TraceFlags: trace.FlagsSampled,
 	})
 	ctx := trace.ContextWithSpanContext(context.Background(), traceContext)
-	tel.recordCandidate(ctx, candidateAction, recordSpan, "lightspeed-agentic-operator", 37)
-	tel.recordRejection(ctx, candidateTranscript, recordSpanEvent, "", rejectQueueFull)
-	tel.recordPublished(ctx, candidateAction, 1, 37)
-	tel.recordFileOperationFailure(ctx, candidateTranscript, opRename)
+	tel.recordAdmission(ctx, "lightspeed-agentic-operator", 37)
+	tel.recordRejection(ctx, "", rejectQueueFull)
+	tel.recordPublished(ctx, 1, 37)
+	tel.recordFileOperationFailure(ctx, opRename)
 
 	var collected metricdata.ResourceMetrics
 	if err := reader.Collect(context.Background(), &collected); err != nil {

@@ -23,7 +23,15 @@ AI agents. Content is optimized for precision and machine consumption.
 | Understand the system | `what/system-overview.md` |
 | Understand the data pipeline | `what/pipeline.md` |
 | HTTPS Prometheus metrics (OLS-3656) | `what/https-metrics.md` |
-| Implement Agentic candidate classification, projection, and Collector integration (OLS-4248) plus bounded file spooling (OLS-4249) | `what/agentic-data-collection.md` |
+| Understand the Collector-local Agentic span eligibility and native OTLP JSONL spool | `what/agentic-data-collection.md` |
+
+The Collector-local native OTLP JSONL implementation is complete; a freshly
+built binary passed healthy, invalid-configuration, and same-process-recovery
+smoke scenarios. The workspace parent spec and ADR 0043 still require the
+former Action/Transcript streams and custom envelope. Their owners,
+operator-generated configuration, and the ready-file consumer must coordinate
+updates before rollout. This Collector change alone does not authorize
+deployment.
 
 ## Conventions
 

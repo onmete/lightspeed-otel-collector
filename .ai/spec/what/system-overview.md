@@ -24,23 +24,23 @@ The Lightspeed OTel Collector is a custom OpenTelemetry Collector distribution t
 
 ### Agentic Data Collection
 
-10. Collector-local trace filtering, atom projection, bounded per-stream queues, and atomic file publication are implemented in `what/agentic-data-collection.md`; the parent [`Agentic Data Collection`](../../../../.ai/spec/what/agentic-data-collection.md) specification owns the end-to-end contract and cross-repository rollout. `[IMPLEMENTED: OLS-4248]` `[IMPLEMENTED: OLS-4249]`
+10. The Collector-local Agentic branch selects spans per the exact service and span-owned correlation rules, then serializes each eligible contextualized span and its nested events as one native OTLP JSONL document in one shared bounded spool. It preserves best-effort fan-out and leaves downstream classification/reconstruction to Dataverse; see `what/agentic-data-collection.md`. `[IMPLEMENTED: OLS-4248]` `[IMPLEMENTED: OLS-4249]` The parent specification and ADR 0043 still require coordinated updates before rollout.
 
 ### Resilience
 
-11. The collector MUST buffer data during transient export failures using a bounded in-memory or persistent queue.
-12. Queue overflow MUST result in back-pressure or oldest-first eviction, never silent data loss.
-13. The collector MUST expose its own health and performance metrics (queue depth, export success/failure rates, dropped spans/metrics).
+11. The collector MAY buffer data during transient export failures using a bounded queue. The Agentic JSONL branch uses its own bounded best-effort spool and does not back-pressure other configured trace destinations; its queue and byte-budget semantics are defined in `what/agentic-data-collection.md`. `[IMPLEMENTED: OLS-4249]`
+12. Queue overflow behavior MUST be explicit. When a selected span cannot be admitted at the 64-job count bound or shared encoded-byte budget, the Agentic exporter rejects one complete document and records the loss without back-pressure to other destinations; the bounds are distinct. `[IMPLEMENTED: OLS-4248]` `[IMPLEMENTED: OLS-4249]`
+13. The collector MUST expose health and performance metrics, including bounded document-loss accounting for the Agentic branch. `[IMPLEMENTED: OLS-4248]`
 
 ## Configuration Surface
 
 | Field/Flag | Type | Default | Description |
 |---|---|---|---|
-| Configuration follows standard OTel Collector YAML config — receivers, processors, exporters, pipelines. Configuration is documented per-component: see `what/collector.md` for Collector configuration, `what/postgres-exporter.md` for the PostgreSQL exporter, and `what/agentic-data-collection.md` for implemented Collector-local Agentic mechanics. ||||
+| Configuration follows standard OTel Collector YAML config — receivers, processors, exporters, pipelines. Configuration is documented per-component: see `what/collector.md` for Collector configuration, `what/postgres-exporter.md` for the PostgreSQL exporter, and `what/agentic-data-collection.md` for the approved Collector-local Agentic native OTLP JSONL contract. ||||
 
-## Planned Changes
+## Collector-local Implementation Status
 
 | Ticket | Summary |
 |---|---|
-| OLS-4248 | Collector-local Agentic classification, projection, telemetry, and exporter integration |
-| OLS-4249 | Collector-local bounded Action/Transcript spooling and recovery |
+| OLS-4248 | Per-span Agentic eligibility, native OTLP documents, telemetry, and exporter integration `[IMPLEMENTED: OLS-4248]` |
+| OLS-4249 | Single shared bounded Agentic JSONL spooling, publication, isolation, and recovery `[IMPLEMENTED: OLS-4249]` |

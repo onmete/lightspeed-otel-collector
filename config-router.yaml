@@ -51,11 +51,10 @@ exporters:
     tls:
       insecure: false
 
-  # Agentic traces → action and transcript JSONL candidate files.
+  # Agentic traces → one native OTLP JSONL document per span.
   agentic:
-    actions_directory: /var/lib/lightspeed-data-collection/actions
-    transcripts_directory: /var/lib/lightspeed-data-collection/transcripts
-    max_backlog_bytes: 4194304
+    directory: /var/lib/lightspeed-data-collection/traces
+    max_backlog_bytes: 8388608
 
   # Debug — prints to stdout (remove in production).
   debug:

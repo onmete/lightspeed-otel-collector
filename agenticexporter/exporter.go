@@ -6,33 +6,39 @@ import (
 
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/exporter"
+	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/ptrace"
 	"go.uber.org/zap"
 )
 
-const projectionQueueCapacity = 64
+const encodingQueueCapacity = 64
+
+type encodingJob struct {
+	traces         ptrace.Traces
+	serviceName    string
+	metricsContext context.Context
+}
 
 type agenticExporter struct {
 	enabled        bool
 	disabledReason configReason
-	actions        *streamWriter
-	transcripts    *streamWriter
+	writer         *streamWriter
 	telemetry      *telemetry
 	logger         *zap.Logger
 	disabledLog    sync.Once
 
-	projectionQueue      chan projectionJob
-	projectionStop       chan struct{}
-	projectionCancel     chan struct{}
-	projectionDone       chan struct{}
-	projectionMu         sync.Mutex
-	projectionStarted    bool
-	projectionStopped    bool
-	projectionCanceled   bool
-	projectionAccepting  bool
-	projectionProcessing bool
-	shutdownOnce         sync.Once
-	shutdownDone         chan struct{}
+	encodingQueue      chan encodingJob
+	encodingStop       chan struct{}
+	encodingCancel     chan struct{}
+	encodingDone       chan struct{}
+	encodingMu         sync.Mutex
+	encodingStarted    bool
+	encodingStopped    bool
+	encodingCanceled   bool
+	encodingAccepting  bool
+	encodingProcessing bool
+	shutdownOnce       sync.Once
+	shutdownDone       chan struct{}
 }
 
 func newAgenticExporter(settings exporter.Settings, cfg *Config) (*agenticExporter, error) {
@@ -46,30 +52,27 @@ func newAgenticExporter(settings exporter.Settings, cfg *Config) (*agenticExport
 		return nil, err
 	}
 
-	actionsDirectory := ""
-	transcriptsDirectory := ""
+	directory := ""
 	maxBacklogBytes := int64(0)
 	if cfg != nil {
-		actionsDirectory = cfg.ActionsDirectory
-		transcriptsDirectory = cfg.TranscriptsDirectory
+		directory = cfg.Directory
 		maxBacklogBytes = cfg.MaxBacklogBytes
 	}
+	writer := newStreamWriter(directory, maxBacklogBytes)
 	e := &agenticExporter{
-		enabled:          assessment.enabled,
-		disabledReason:   assessment.reason,
-		actions:          newStreamWriter(candidateAction, actionsDirectory, maxBacklogBytes),
-		transcripts:      newStreamWriter(candidateTranscript, transcriptsDirectory, maxBacklogBytes),
-		telemetry:        tel,
-		logger:           logger,
-		projectionQueue:  make(chan projectionJob, projectionQueueCapacity),
-		projectionStop:   make(chan struct{}),
-		projectionCancel: make(chan struct{}),
-		projectionDone:   make(chan struct{}),
-		shutdownDone:     make(chan struct{}),
+		enabled:        assessment.enabled,
+		disabledReason: assessment.reason,
+		writer:         writer,
+		telemetry:      tel,
+		logger:         logger,
+		encodingQueue:  make(chan encodingJob, encodingQueueCapacity),
+		encodingStop:   make(chan struct{}),
+		encodingCancel: make(chan struct{}),
+		encodingDone:   make(chan struct{}),
+		shutdownDone:   make(chan struct{}),
 	}
-	e.actions.callbacks = e.callbacks()
-	e.transcripts.callbacks = e.callbacks()
-	if err := tel.registerWriters(e.actions, e.transcripts); err != nil {
+	writer.callbacks = e.callbacks()
+	if err := tel.registerWriter(writer); err != nil {
 		tel.close()
 		return nil, err
 	}
@@ -78,24 +81,24 @@ func newAgenticExporter(settings exporter.Settings, cfg *Config) (*agenticExport
 
 func (e *agenticExporter) callbacks() streamCallbacks {
 	return streamCallbacks{
-		stateChanged: func(candidate candidateType, _ streamState, to streamState, operation fileOperation) {
+		stateChanged: func(from, to streamState, operation fileOperation) {
 			e.logger.Warn(
 				"agentic exporter stream state changed",
-				zap.String("candidate_type", string(candidate)),
+				zap.String("from_state", streamStateLabel(from)),
 				zap.String("state", streamStateLabel(to)),
 				zap.String("operation", fileOperationLabel(operation)),
 			)
 		},
-		operationFailed: func(candidate candidateType, operation fileOperation) {
-			e.telemetry.recordFileOperationFailure(context.Background(), candidate, operation)
+		operationFailed: func(operation fileOperation) {
+			e.telemetry.recordFileOperationFailure(context.Background(), operation)
 		},
-		published: func(candidate candidateType, records, bytes int64) {
-			e.telemetry.recordPublished(context.Background(), candidate, records, bytes)
+		published: func(records, bytes int64) {
+			e.telemetry.recordPublished(context.Background(), records, bytes)
 		},
-		shutdownDeadline: func(candidate candidateType, records, bytes int64) {
+		shutdownDeadline: func(records, bytes int64) {
 			e.logger.Warn(
 				"agentic exporter shutdown deadline reached",
-				zap.String("candidate_type", string(candidate)),
+				zap.String("reason", string(rejectShutdown)),
 				zap.Int64("unpublished_records", records),
 				zap.Int64("unpublished_bytes", bytes),
 			)
@@ -113,9 +116,8 @@ func (e *agenticExporter) start(ctx context.Context, _ component.Host) error {
 		})
 		return nil
 	}
-	e.startProjection()
-	_ = e.actions.start(ctx)
-	_ = e.transcripts.start(ctx)
+	_ = e.writer.start(ctx)
+	e.startEncoding()
 	return nil
 }
 
@@ -127,44 +129,25 @@ func (e *agenticExporter) consumeTraces(ctx context.Context, traces ptrace.Trace
 
 	resourceSpans := traces.ResourceSpans()
 	for resourceIndex := range resourceSpans.Len() {
-		resourceSpan := resourceSpans.At(resourceIndex)
-		resource := resourceSpan.Resource()
-		scopeSpans := resourceSpan.ScopeSpans()
+		resource := resourceSpans.At(resourceIndex)
+		serviceName, _ := stringAttribute(resource.Resource().Attributes(), "service.name")
+		scopeSpans := resource.ScopeSpans()
 		for scopeIndex := range scopeSpans.Len() {
-			scopeSpan := scopeSpans.At(scopeIndex)
-			scope := scopeSpan.Scope()
-			spans := scopeSpan.Spans()
+			scope := scopeSpans.At(scopeIndex)
+			spans := scope.Spans()
 			for spanIndex := range spans.Len() {
 				span := spans.At(spanIndex)
-				spanCtx, rejection := classifySpan(resource.Attributes(), span)
+				spanCtx, rejection := classifySpan(resource.Resource().Attributes(), span)
 				if rejection != rejectNone {
-					serviceName, _ := stringAttribute(resource.Attributes(), "service.name")
-					e.telemetry.recordRejection(metricsCtx, candidateAction, recordSpan, serviceName, rejection)
-					events := span.Events()
-					for eventIndex := range events.Len() {
-						e.telemetry.recordRejection(
-							metricsCtx,
-							classifyEvent(events.At(eventIndex)),
-							recordSpanEvent,
-							serviceName,
-							rejection,
-						)
-					}
+					e.telemetry.recordRejection(metricsCtx, serviceName, rejection)
 					continue
 				}
-
-				input := projectionInput{
-					candidate:         candidateAction,
-					kind:              recordSpan,
-					context:           spanCtx,
-					resource:          resource,
-					resourceSchemaURL: resourceSpan.SchemaUrl(),
-					scope:             scope,
-					scopeSchemaURL:    scopeSpan.SchemaUrl(),
-					span:              span,
+				if span.TraceID() == (pcommon.TraceID{}) || span.SpanID() == (pcommon.SpanID{}) {
+					e.telemetry.recordRejection(metricsCtx, spanCtx.serviceName, rejectInvalidTraceIdentity)
+					continue
 				}
-				if !e.tryEnqueueProjection(metricsCtx, input) {
-					e.recordQueueRejections(metricsCtx, spanCtx, span)
+				if !e.tryEnqueueEncoding(metricsCtx, resource, scope, span, spanCtx.serviceName) {
+					e.telemetry.recordRejection(metricsCtx, spanCtx.serviceName, rejectQueueFull)
 				}
 			}
 		}
@@ -172,248 +155,210 @@ func (e *agenticExporter) consumeTraces(ctx context.Context, traces ptrace.Trace
 	return nil
 }
 
-func (e *agenticExporter) recordQueueRejections(ctx context.Context, spanCtx spanContext, span ptrace.Span) {
-	e.telemetry.recordRejection(ctx, candidateAction, recordSpan, spanCtx.serviceName, rejectQueueFull)
-	events := span.Events()
-	for eventIndex := range events.Len() {
-		e.telemetry.recordRejection(
-			ctx,
-			classifyEvent(events.At(eventIndex)),
-			recordSpanEvent,
-			spanCtx.serviceName,
-			rejectQueueFull,
-		)
-	}
+func newEncodingJob(
+	ctx context.Context,
+	resource ptrace.ResourceSpans,
+	scope ptrace.ScopeSpans,
+	span ptrace.Span,
+	serviceName string,
+) encodingJob {
+	copied := ptrace.NewTraces()
+	targetResource := copied.ResourceSpans().AppendEmpty()
+	resource.Resource().CopyTo(targetResource.Resource())
+	targetResource.SetSchemaUrl(resource.SchemaUrl())
+	targetScope := targetResource.ScopeSpans().AppendEmpty()
+	scope.Scope().CopyTo(targetScope.Scope())
+	targetScope.SetSchemaUrl(scope.SchemaUrl())
+	span.CopyTo(targetScope.Spans().AppendEmpty())
+	return encodingJob{traces: copied, serviceName: serviceName, metricsContext: ctx}
 }
 
-func (e *agenticExporter) projectAndAdmit(ctx context.Context, input projectionInput) {
-	record, err := project(input)
-	if err != nil {
-		e.telemetry.recordRejection(ctx, input.candidate, input.kind, input.context.serviceName, rejectInvalidEnvelope)
-		e.logger.Error(
-			"agentic exporter rejected candidate",
-			zap.String("reason", string(rejectInvalidEnvelope)),
-		)
-		return
-	}
-	writer := e.actions
-	if input.candidate == candidateTranscript {
-		writer = e.transcripts
-	}
-	if !writer.tryEnqueue(record) {
-		e.telemetry.recordRejection(ctx, input.candidate, input.kind, input.context.serviceName, rejectQueueFull)
-		return
-	}
-	e.telemetry.recordCandidate(ctx, input.candidate, input.kind, input.context.serviceName, len(record))
-}
-
-func (e *agenticExporter) startProjection() {
-	e.projectionMu.Lock()
-	if e.projectionStarted {
-		e.projectionMu.Unlock()
-		return
-	}
-	e.projectionStarted = true
-	e.projectionAccepting = true
-	done := e.projectionDone
-	e.projectionMu.Unlock()
-	go func() {
-		defer close(done)
-		e.runProjection()
-	}()
-}
-
-func (e *agenticExporter) runProjection() {
-	defer func() {
-		e.projectionMu.Lock()
-		e.projectionProcessing = false
-		e.projectionMu.Unlock()
-	}()
-	for {
-		select {
-		case <-e.projectionCancel:
-			e.discardProjectionQueue()
-			return
-		default:
-		}
-		select {
-		case <-e.projectionCancel:
-			e.discardProjectionQueue()
-			return
-		case <-e.projectionStop:
-			for {
-				select {
-				case <-e.projectionCancel:
-					e.discardProjectionQueue()
-					return
-				default:
-				}
-				select {
-				case <-e.projectionCancel:
-					e.discardProjectionQueue()
-					return
-				case job := <-e.projectionQueue:
-					e.processProjectionJob(job)
-				default:
-					return
-				}
-			}
-		case job := <-e.projectionQueue:
-			e.processProjectionJob(job)
-		}
-	}
-}
-
-func (e *agenticExporter) discardProjectionQueue() {
-	for {
-		select {
-		case job := <-e.projectionQueue:
-			e.recordProjectionRejections(job)
-		default:
-			return
-		}
-	}
-}
-
-func (e *agenticExporter) recordProjectionRejections(job projectionJob) {
-	span := job.traces.ResourceSpans().At(0).ScopeSpans().At(0).Spans().At(0)
-	e.telemetry.recordRejection(
-		job.metricsContext,
-		candidateAction,
-		recordSpan,
-		job.context.serviceName,
-		rejectShutdown,
-	)
-	for eventIndex := range span.Events().Len() {
-		e.telemetry.recordRejection(
-			job.metricsContext,
-			classifyEvent(span.Events().At(eventIndex)),
-			recordSpanEvent,
-			job.context.serviceName,
-			rejectShutdown,
-		)
-	}
-}
-
-func (e *agenticExporter) recordProjectionEventRejection(job projectionJob, event ptrace.SpanEvent) {
-	e.telemetry.recordRejection(
-		job.metricsContext,
-		classifyEvent(event),
-		recordSpanEvent,
-		job.context.serviceName,
-		rejectShutdown,
-	)
-}
-
-func (e *agenticExporter) projectionCancellationRequested() bool {
-	e.projectionMu.Lock()
-	defer e.projectionMu.Unlock()
-	return e.projectionCanceled
-}
-
-func (e *agenticExporter) processProjectionJob(job projectionJob) {
-	if e.projectionCancellationRequested() {
-		e.recordProjectionRejections(job)
-		return
-	}
-	defer func() {
-		e.projectionMu.Lock()
-		e.projectionProcessing = len(e.projectionQueue) != 0
-		e.projectionMu.Unlock()
-	}()
-
-	resourceSpan := job.traces.ResourceSpans().At(0)
-	scopeSpan := resourceSpan.ScopeSpans().At(0)
-	span := scopeSpan.Spans().At(0)
-	e.projectAndAdmit(job.metricsContext, projectionInput{
-		candidate:         candidateAction,
-		kind:              recordSpan,
-		context:           job.context,
-		resource:          resourceSpan.Resource(),
-		resourceSchemaURL: job.resourceSchemaURL,
-		scope:             scopeSpan.Scope(),
-		scopeSchemaURL:    job.scopeSchemaURL,
-		span:              span,
-	})
-	events := span.Events()
-	for eventIndex := range events.Len() {
-		if e.projectionCancellationRequested() {
-			for remaining := eventIndex; remaining < events.Len(); remaining++ {
-				e.recordProjectionEventRejection(job, events.At(remaining))
-			}
-			return
-		}
-		event := events.At(eventIndex)
-		index := eventIndex
-		e.projectAndAdmit(job.metricsContext, projectionInput{
-			candidate:         classifyEvent(event),
-			kind:              recordSpanEvent,
-			context:           job.context,
-			resource:          resourceSpan.Resource(),
-			resourceSchemaURL: job.resourceSchemaURL,
-			scope:             scopeSpan.Scope(),
-			scopeSchemaURL:    job.scopeSchemaURL,
-			span:              span,
-			event:             &event,
-			eventIndex:        &index,
-		})
-	}
-}
-
-func (e *agenticExporter) tryEnqueueProjection(ctx context.Context, input projectionInput) bool {
-	e.projectionMu.Lock()
-	defer e.projectionMu.Unlock()
-	if !e.projectionAccepting || len(e.projectionQueue) == cap(e.projectionQueue) {
+func (e *agenticExporter) tryEnqueueEncoding(
+	ctx context.Context,
+	resource ptrace.ResourceSpans,
+	scope ptrace.ScopeSpans,
+	span ptrace.Span,
+	serviceName string,
+) bool {
+	e.encodingMu.Lock()
+	defer e.encodingMu.Unlock()
+	if !e.encodingAccepting || len(e.encodingQueue) == cap(e.encodingQueue) {
 		return false
 	}
-	e.projectionProcessing = true
-	e.projectionQueue <- newProjectionJob(ctx, input)
+	e.encodingProcessing = true
+	e.encodingQueue <- newEncodingJob(ctx, resource, scope, span, serviceName)
 	return true
 }
 
-func (e *agenticExporter) projectionIdle() bool {
-	e.projectionMu.Lock()
-	defer e.projectionMu.Unlock()
-	return len(e.projectionQueue) == 0 && !e.projectionProcessing
+func (e *agenticExporter) encodeAndAdmit(job encodingJob) {
+	marshaler := ptrace.JSONMarshaler{}
+	encoded, err := marshaler.MarshalTraces(job.traces)
+	if err != nil {
+		e.telemetry.recordRejection(job.metricsContext, job.serviceName, rejectEncoding)
+		e.logger.Error("agentic exporter encoding failed", zap.String("reason", string(rejectEncoding)))
+		return
+	}
+	tooLarge := len(encoded) >= maxEncodedRecordBytes // encoded JSON plus LF exceeds the cap
+	size := len(encoded) + 1
+	if !tooLarge {
+		encoded = append(encoded, '\n')
+	}
+	e.encodingMu.Lock()
+	canceled := e.encodingCanceled
+	accepted := false
+	if !canceled && !tooLarge {
+		accepted = e.writer.tryEnqueue(encoded)
+	}
+	e.encodingMu.Unlock()
+	if canceled {
+		e.recordEncodingRejection(job)
+		return
+	}
+	if tooLarge {
+		e.telemetry.recordRejection(job.metricsContext, job.serviceName, rejectRecordTooLarge)
+		return
+	}
+	if !accepted {
+		e.telemetry.recordRejection(job.metricsContext, job.serviceName, rejectQueueFull)
+		return
+	}
+	e.telemetry.recordAdmission(job.metricsContext, job.serviceName, size)
 }
 
-func (e *agenticExporter) waitProjectionDone() {
-	e.projectionMu.Lock()
-	started := e.projectionStarted
-	done := e.projectionDone
-	e.projectionMu.Unlock()
+func (e *agenticExporter) startEncoding() {
+	e.encodingMu.Lock()
+	if e.encodingStarted {
+		e.encodingMu.Unlock()
+		return
+	}
+	e.encodingStarted = true
+	e.encodingAccepting = true
+	done := e.encodingDone
+	e.encodingMu.Unlock()
+	go func() {
+		defer close(done)
+		e.runEncoding()
+	}()
+}
+
+func (e *agenticExporter) runEncoding() {
+	defer func() {
+		e.encodingMu.Lock()
+		e.encodingProcessing = false
+		e.encodingMu.Unlock()
+	}()
+	for {
+		select {
+		case <-e.encodingCancel:
+			e.discardEncodingQueue()
+			return
+		default:
+		}
+		select {
+		case <-e.encodingCancel:
+			e.discardEncodingQueue()
+			return
+		case <-e.encodingStop:
+			for {
+				select {
+				case <-e.encodingCancel:
+					e.discardEncodingQueue()
+					return
+				default:
+				}
+				select {
+				case <-e.encodingCancel:
+					e.discardEncodingQueue()
+					return
+				case job := <-e.encodingQueue:
+					e.processEncodingJob(job)
+				default:
+					return
+				}
+			}
+		case job := <-e.encodingQueue:
+			e.processEncodingJob(job)
+		}
+	}
+}
+
+func (e *agenticExporter) discardEncodingQueue() {
+	for {
+		select {
+		case job := <-e.encodingQueue:
+			e.recordEncodingRejection(job)
+		default:
+			return
+		}
+	}
+}
+
+func (e *agenticExporter) recordEncodingRejection(job encodingJob) {
+	e.telemetry.recordRejection(job.metricsContext, job.serviceName, rejectShutdown)
+}
+
+func (e *agenticExporter) encodingCancellationRequested() bool {
+	e.encodingMu.Lock()
+	defer e.encodingMu.Unlock()
+	return e.encodingCanceled
+}
+
+func (e *agenticExporter) processEncodingJob(job encodingJob) {
+	if e.encodingCancellationRequested() {
+		e.recordEncodingRejection(job)
+		return
+	}
+	defer func() {
+		e.encodingMu.Lock()
+		e.encodingProcessing = len(e.encodingQueue) != 0
+		e.encodingMu.Unlock()
+	}()
+	e.encodeAndAdmit(job)
+}
+
+func (e *agenticExporter) encodingIdle() bool {
+	e.encodingMu.Lock()
+	defer e.encodingMu.Unlock()
+	return len(e.encodingQueue) == 0 && !e.encodingProcessing
+}
+
+func (e *agenticExporter) waitEncodingDone() {
+	e.encodingMu.Lock()
+	started := e.encodingStarted
+	done := e.encodingDone
+	e.encodingMu.Unlock()
 	if started {
 		<-done
 	}
 }
 
-func (e *agenticExporter) stopProjection(ctx context.Context) {
+func (e *agenticExporter) stopEncoding(ctx context.Context) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	e.projectionMu.Lock()
-	if !e.projectionStarted {
-		e.projectionAccepting = false
-		e.projectionMu.Unlock()
+	e.encodingMu.Lock()
+	if !e.encodingStarted {
+		e.encodingAccepting = false
+		e.encodingMu.Unlock()
 		return
 	}
-	e.projectionAccepting = false
-	if !e.projectionStopped {
-		e.projectionStopped = true
-		close(e.projectionStop)
+	e.encodingAccepting = false
+	if !e.encodingStopped {
+		e.encodingStopped = true
+		close(e.encodingStop)
 	}
-	done := e.projectionDone
-	e.projectionMu.Unlock()
+	done := e.encodingDone
+	e.encodingMu.Unlock()
 
 	select {
 	case <-done:
 	case <-ctx.Done():
-		e.projectionMu.Lock()
-		if !e.projectionCanceled {
-			e.projectionCanceled = true
-			close(e.projectionCancel)
+		e.encodingMu.Lock()
+		if !e.encodingCanceled {
+			e.encodingCanceled = true
+			close(e.encodingCancel)
 		}
-		e.projectionMu.Unlock()
+		e.encodingMu.Unlock()
 	}
 }
 
@@ -438,19 +383,9 @@ func (e *agenticExporter) shutdown(ctx context.Context) error {
 func (e *agenticExporter) shutdownOnceRun(ctx context.Context) {
 	defer close(e.shutdownDone)
 	if e.enabled {
-		e.stopProjection(ctx)
-		var wait sync.WaitGroup
-		wait.Add(2)
-		go func() {
-			defer wait.Done()
-			e.actions.shutdown(ctx)
-		}()
-		go func() {
-			defer wait.Done()
-			e.transcripts.shutdown(ctx)
-		}()
-		wait.Wait()
-		e.waitProjectionDone()
+		e.stopEncoding(ctx)
+		e.writer.shutdown(ctx)
+		e.waitEncodingDone()
 	}
 	e.telemetry.close()
 }
