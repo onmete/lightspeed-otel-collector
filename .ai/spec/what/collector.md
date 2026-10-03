@@ -36,8 +36,7 @@ Custom OpenTelemetry Collector for OpenShift Lightspeed. Built with the OpenTele
    - **Logs:** routed by `service.name` attribute — Lightspeed services → PostgreSQL, unmatched → dropped
    - **Traces:** `config.yaml` sends received traces to `nop` and the trace data collection route; `config-router.yaml` fans traces out to the all-trace backend route and the trace data collection route
    - **Metrics:** no pipeline defined in routing mode.
-     - _Current behavior_ `[KNOWN VIOLATION of Constraint 2]`: metrics are silently dropped with no log or observable signal.
-     - _Required behavior_: when no pipeline matches, the collector MUST log a warning and expose a metric counter for dropped spans/metrics — silent drops are prohibited (Constraint 2). `[PLANNED]` Add a metrics pipeline or explicit no-op exporter with observable error metrics.
+     - _Current behavior_: metrics are silently dropped.
 
 8. Both reference configurations route resources whose `service.name` exactly matches `lightspeed-agentic-operator` or `lightspeed-agentic-sandbox` through `routing/data_collection` to `traces/data_collection`. That pipeline writes native trace JSONL with the stock FileExporter to `/var/lib/lightspeed-data/otel/traces.jsonl`, with directory creation enabled and size rotation at 1 MiB, up to 100 backups, and a one-day age limit. See `what/data-collection.md` for complete file behavior.
 

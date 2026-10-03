@@ -160,7 +160,8 @@ standalone local procedure below to exercise this Collector-only change.
 This launches the built Collector directly with a loopback-only, no-TLS config;
 it does not depend on operator-generated configuration, PostgreSQL, or a
 container image. It needs `make`, Go 1.26.0+ (the module directive), `curl`,
-`jq`, and Bash. Run from the repository root:
+`jq`, Bash 4.4+, and GNU coreutils `date` on `PATH` (for `%s%N`). Run from the
+repository root:
 
 ```bash
 set -euo pipefail
